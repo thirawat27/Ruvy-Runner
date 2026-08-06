@@ -31,12 +31,12 @@ type SignalBody =
   | { op: 'answer';  code: string; sdp: string }
   | { op: 'poll';    code: string; want: 'offer' | 'answer' }
 
-export async function POST(req: Request) {
+export async function POST({ request }: { request: Request }) {
   gc()
 
   let body: SignalBody
   try {
-    body = (await req.json()) as SignalBody
+    body = (await request.json()) as SignalBody
   } catch {
     return Response.json({ error: 'invalid JSON body' }, { status: 400 })
   }
