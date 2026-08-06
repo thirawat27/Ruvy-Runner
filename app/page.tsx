@@ -156,6 +156,8 @@ export default function Home() {
   /* ── Derived display strings ── */
   const scoreStr = String(score).padStart(6, '0')
   const bestStr  = String(best).padStart(6, '0')
+  const mySlot   = duoConfig?.slot ?? 1
+  const theirSlot = mySlot === 1 ? 2 : 1
   const hpPct    = bossMaxHp > 0 ? Math.max(0, (bossHp / bossMaxHp) * 100) : 0
   const maxAmmo  = 3
 
@@ -175,21 +177,25 @@ export default function Home() {
         </div>
 
         <div className="hud-score-group">
+          <div className="hud-stat">
+            <div className="hud-stat-label" style={isDuo && duoStep === 'connected' ? { color: '#8b5cf6' } : undefined}>
+              {isDuo && duoStep === 'connected' ? `P${mySlot} SCORE` : 'Score'}
+            </div>
+            <div className="hud-stat-value" style={isDuo && duoStep === 'connected' ? { color: '#8b5cf6' } : undefined}>
+              {scoreStr}
+            </div>
+          </div>
           {isDuo && duoStep === 'connected' && (
             <>
+              <div className="hud-divider" />
               <div className="hud-stat">
-                <div className="hud-stat-label" style={{ color: '#fb923c' }}>P2 SCORE</div>
+                <div className="hud-stat-label" style={{ color: '#fb923c' }}>P{theirSlot} SCORE</div>
                 <div className="hud-stat-value" style={{ color: '#fb923c' }}>
                   {String(remoteScore).padStart(6, '0')}
                 </div>
               </div>
-              <div className="hud-divider" />
             </>
           )}
-          <div className="hud-stat">
-            <div className="hud-stat-label">Score</div>
-            <div className="hud-stat-value">{scoreStr}</div>
-          </div>
           <div className="hud-divider" />
           <div className="hud-stat">
             <div className="hud-stat-label">Best</div>
