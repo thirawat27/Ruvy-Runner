@@ -718,6 +718,11 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
     const isTabDuo   = duo?.mode === 'tab' || duo?.mode === 'rtc'
     const mySlot     = duo?.slot ?? 1
 
+    // Online duo: each slot owns a lane. Without this both peers run at the default
+    // x=48 while drawing the partner ghost at the *other* lane, so slot 2 renders its
+    // own runner exactly on top of the ghost.
+    if (isTabDuo && mySlot === 2) runner.x = 96
+
     // P2 runner (local duo — both runners share the same canvas and obstacles)
     const runner2 = { x: 96, y: GROUND_Y - 8 * PIXEL, vy: 0, onGround: true }
     let ducking2 = false
@@ -731,6 +736,10 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
     let remoteDuck   = false
     let remoteAmmo   = MAX_AMMO
     let remoteScore  = 0
+    let remoteAlive  = true
+    // Drives the outbound send rate on its own. `frame` stops advancing while paused,
+    // which would pin `frame % 2` to a constant and make the throttle meaningless.
+    let netTick      = 0
 
     function seedScenery() {
       scenery = []
@@ -1574,20 +1583,6 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
           }
         }
 
-        // ── Tab-duo: broadcast own runner state every other frame ──────────
-        if (isTabDuo && duo?.channel && frame % 2 === 0) {
-          duo.channel.postMessage({
-            type: 'runner-state',
-            slot: mySlot,
-            y: runner.y,
-            onGround: runner.onGround,
-            ducking,
-            ammo,
-            score,
-            alive: !gameOver,
-          })
-        }
-
         if (!boss && score >= nextBossAt) {
           // Prefer a variant the run still needs for its objective, so progress is
           // reachable without grinding on random draws.
@@ -1813,6 +1808,23 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
         }
       }
 
+      // ── Tab-duo: broadcast own runner state every other frame ────────────
+      // Deliberately outside the started/gameOver/paused gate above: a peer that is
+      // still on the title screen, dead, or paused must keep publishing, otherwise the
+      // partner's ghost freezes on the last frame it happened to receive.
+      if (isTabDuo && duo?.channel && netTick++ % 2 === 0) {
+        duo.channel.postMessage({
+          type: 'runner-state',
+          slot: mySlot,
+          y: runner.y,
+          onGround: runner.onGround,
+          ducking,
+          ammo,
+          score,
+          alive: started && !gameOver,
+        })
+      }
+
       // particles
       if (!paused) {
         for (const p of particles) {
@@ -1855,8 +1867,14 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
       const gaitBob =
         !duckNow && started && runner.onGround && (gaitFrame === 1 || gaitFrame === 3) ? -1 : 0
       const runnerDrawY = (duckNow ? GROUND_Y - sprH(RUNNER_DUCK) : runner.y) + gaitBob
+      // Colour follows the slot, not the viewer. Drawing the local runner purple on both
+      // peers made slot 2 see two purple runners while slot 1 saw purple + orange — the
+      // same room described two different ways.
+      const meIsP2 = isTabDuo && mySlot === 2
       drawOutline(runSprite, runner.x, runnerDrawY, PIXEL, outline)
-      drawSprite(runSprite, runner.x, runnerDrawY, PIXEL, SPRITE_COLOR)
+      drawSprite(runSprite, runner.x, runnerDrawY, PIXEL,
+        meIsP2 ? SPRITE_COLOR_2 : SPRITE_COLOR,
+        meIsP2 ? ACCENT_2 : ACCENT)
 
       // ── Draw P2 runner (local duo) ─────────────────────────────────────
       if (isLocalDuo) {
@@ -1886,9 +1904,18 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
       if (isTabDuo) {
         const ghostX   = mySlot === 1 ? 96 : 48
         const ghostY   = remoteGround ? GROUND_Y - 8 * PIXEL : remoteY
-        const ghostSp  = remoteDuck && remoteGround ? RUNNER_DUCK : RUNNER_SPRITE
-        const ghostDrawY = remoteDuck && remoteGround ? GROUND_Y - sprH(RUNNER_DUCK) : ghostY
-        ctx!.globalAlpha = 0.55
+        const ghostDuck = remoteDuck && remoteGround
+        // Run the same gait cycle the local runner uses. Pinning the ghost to the idle
+        // sprite made a partner who was actually sprinting look frozen in place.
+        const ghostFrame = Math.floor(frame / 8) % RUNNER_FRAMES.length
+        const ghostSp  = ghostDuck
+          ? RUNNER_DUCK
+          : remoteAlive && remoteGround
+            ? RUNNER_FRAMES[ghostFrame]
+            : RUNNER_SPRITE
+        const ghostBob = !ghostDuck && remoteAlive && remoteGround && (ghostFrame === 1 || ghostFrame === 3) ? -1 : 0
+        const ghostDrawY = (ghostDuck ? GROUND_Y - sprH(RUNNER_DUCK) : ghostY) + ghostBob
+        ctx!.globalAlpha = remoteAlive ? 0.55 : 0.25
         drawOutline(ghostSp, ghostX, ghostDrawY, PIXEL, outline)
         drawSprite(ghostSp, ghostX, ghostDrawY, PIXEL, mySlot === 1 ? SPRITE_COLOR_2 : SPRITE_COLOR,
           mySlot === 1 ? ACCENT_2 : ACCENT)
@@ -2058,6 +2085,7 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
         remoteDuck   = e.data.ducking ?? remoteDuck
         remoteAmmo   = e.data.ammo ?? remoteAmmo
         remoteScore  = e.data.score ?? remoteScore
+        remoteAlive  = e.data.alive ?? remoteAlive
         // Emit partner's ammo for a shared HUD if ever needed
         emit({ remoteAmmo, remoteScore })
       }
