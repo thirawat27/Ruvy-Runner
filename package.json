@@ -1,0 +1,39 @@
+{
+  "name": "ruvy-runner",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "ruvyxa dev",
+    "build": "ruvyxa build",
+    "start": "ruvyxa start",
+    "preview": "ruvyxa preview",
+    "typecheck": "tsc --noEmit",
+    "check": "ruvyxa check",
+    "routes": "ruvyxa routes",
+    "routes:json": "ruvyxa routes --json",
+    "analyze": "ruvyxa analyze",
+    "analyze:html": "ruvyxa analyze --html",
+    "adds": "ruvyxa adds",
+    "doctor": "ruvyxa doctor",
+    "clean": "ruvyxa clean",
+    "trace": "ruvyxa trace",
+    "bench": "ruvyxa bench",
+    "test:parity": "ruvyxa test:parity",
+    "plugin": "ruvyxa plugin"
+  },
+  "dependencies": {
+    "@ruvyxa/react": "^1.0.27",
+    "ruvyxa": "^1.0.27",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.4",
+    "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=22.12.0"
+  }
+}
