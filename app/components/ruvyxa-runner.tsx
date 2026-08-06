@@ -503,33 +503,34 @@ const THEME_STEP = 400
 const AI_MAX_DELAY = 36
 const AI_ACTIONS = ['duck', 'jump'] as const
 
-// Tier rises with both mastery (bosses beaten) and raw distance covered, so a run that is
-// avoiding fights by luck still faces the escalation, not just one that is winning them.
-// From tier 3 onward a boss starts mixing in another variant's attack, so a memorised
-// dodge decays over a long run.
+// Tier rises with mastery (bosses beaten), raw distance (score), AND time played.
+// From tier 3 onward a boss starts mixing in another variant's attack.
 const BOSS_MIX_TIER = 3
-// Score interval per extra distance-tier. No ceiling on the tier itself — the difficulty
-// ceiling instead lives in scaleBoss()'s per-stat caps below, on the two axes that
-// actually gate dodgeability (fire rate, shot speed). Every other axis — HP, closing
-// speed — is safe to keep raising forever: it makes a fight longer or a boss pushier,
-// never turns a dodgeable pattern into an undodgeable one.
-const DISTANCE_TIER_STEP = 15_000
+// Score per distance-tier — halved from original for faster escalation.
+const DISTANCE_TIER_STEP = 8_000
+// Frames per time-tier (~2 min at 60 fps). Time alone pushes tier even if the
+// player avoids bosses, preventing difficulty stagnation in long runs.
+const TIME_TIER_FRAMES = 60 * 60 * 2   // 7 200 frames ≈ 2 minutes
 
-function bossTier(score: number, bossesDefeated: number) {
-  return bossesDefeated + Math.floor(score / DISTANCE_TIER_STEP)
+// Accept frameCount so time-based tier works inside the useEffect closure.
+function bossTier(score: number, bossesDefeated: number, frameCount: number) {
+  return (
+    bossesDefeated +
+    Math.floor(score / DISTANCE_TIER_STEP) +
+    Math.floor(frameCount / TIME_TIER_FRAMES)
+  )
 }
 
 function scaleBoss(variant: BossVariant, tier: number) {
   return {
-    // Capped so a marathon run gets a tougher fight, not a bullet-sponge no ammo budget
-    // could ever clear.
-    hp: variant.hp + Math.min(30, Math.floor(tier / 2)),
-    // Floor keeps every burst/split/flicker pattern within the gap the AI (and a human)
-    // proved dodgeable in testing, no matter how large tier grows.
-    fireInterval: Math.max(70, Math.round(variant.fireInterval - tier * 7)),
-    approachSpeed: Math.min(variant.approachSpeed + tier * 0.1, variant.approachSpeed + 6),
-    // Same reasoning as fireInterval: this ceiling is the actual difficulty limiter.
-    shotSpeed: Math.min(1.5, tier * 0.16),
+    // HP scales hard — bullet-sponge is fine because ammo regens during a fight.
+    hp: variant.hp + Math.floor(tier * 1.8),
+    // Minimum interval 40 frames (was 70) — bosses fire much faster at high tiers.
+    fireInterval: Math.max(40, Math.round(variant.fireInterval - tier * 10)),
+    // Boss rushes player more aggressively.
+    approachSpeed: Math.min(variant.approachSpeed + tier * 0.25, variant.approachSpeed + 9),
+    // Bullet speed cap raised to 3.5 (was 1.5) — fast enough to demand precision.
+    shotSpeed: Math.min(3.5, tier * 0.32),
   }
 }
 
@@ -629,6 +630,8 @@ type Boss = {
   approachSpeed: number
   shotSpeed: number
   attack: BossAttack
+  /** Set to true when HP drops to ≤50 % — triggers rage-mode fire rate and approach. */
+  enraged: boolean
 }
 type Scenery = {
   x: number
@@ -637,10 +640,19 @@ type Scenery = {
   size: number
 }
 
+/** Minimal channel contract — satisfied by both BroadcastChannel and RtcPeer. */
+export interface ChannelLike {
+  postMessage(data: unknown): void
+  onmessage: ((e: MessageEvent) => void) | null
+  addEventListener(type: string, listener: (e: MessageEvent) => void): void
+  removeEventListener(type: string, listener: (e: MessageEvent) => void): void
+  close(): void
+}
+
 export interface DuoConfig {
-  mode: 'local' | 'tab'
-  slot?: 1 | 2          // 'tab' only: which player slot this tab occupies
-  channel?: BroadcastChannel | null
+  mode: 'local' | 'tab' | 'rtc'
+  slot?: 1 | 2          // 'tab' / 'rtc': which player slot this peer occupies
+  channel?: ChannelLike | null
 }
 
 export interface RuvyxaRunnerProps {
@@ -681,6 +693,9 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
     // habit instead of firing blind.
     let dodgeDuckFrames = 0
     let dodgeAirFrames = 0
+    // Consecutive frames the runner has been crouching during this boss fight.
+    // When this crosses a threshold the boss fires a low-lane punisher that MUST be jumped.
+    let duckStreakFrames = 0
     let autoPlay = false
     let aiShotCooldown = 0
     let aiRestartTimer = 0
@@ -700,7 +715,7 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
     // ── DUO MODE variables ─────────────────────────────────────────────────
     const duo = duoConfig ?? null
     const isLocalDuo = duo?.mode === 'local'
-    const isTabDuo   = duo?.mode === 'tab'
+    const isTabDuo   = duo?.mode === 'tab' || duo?.mode === 'rtc'
     const mySlot     = duo?.slot ?? 1
 
     // P2 runner (local duo — both runners share the same canvas and obstacles)
@@ -777,6 +792,7 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
       overclockFrames = 0
       dodgeDuckFrames = 0
       dodgeAirFrames = 0
+      duckStreakFrames = 0
       aiShotCooldown = 0
       aiRestartTimer = 0
       seedScenery()
@@ -883,6 +899,9 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
     // Standing clears a high shot only by crouching; a low shot has to be jumped.
     const HIGH_LANE = GROUND_Y - 26
     const LOW_LANE = GROUND_Y - 14
+    // Shots that travel along the ground itself — only a jump clears them AND they
+    // cannot be crouched (hitbox is at knee level). Used as the crouch-punish lane.
+    const GROUND_LANE = GROUND_Y - 10
 
     function makeShot(
       x: number,
@@ -909,6 +928,20 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
       return dodgeDuckFrames <= dodgeAirFrames
     }
 
+    // Returns true when the runner has been crouching long enough that the boss should
+    // punish it with a GROUND_LANE shot that cannot be crouched through.
+    function shouldPunishCrouch(): boolean {
+      // 40 frames (~0.67 s) of sustained crouching triggers a punisher.
+      return duckStreakFrames >= 40
+    }
+
+    // How many extra parallel shots a boss fires per volley based on tier.
+    // Gives high-tier bosses genuine pressure even against experienced players.
+    function extraShotCount(b: Boss): number {
+      const base = b.tier >= 9 ? 2 : b.tier >= 5 ? 1 : 0
+      return b.enraged ? base + 1 : base
+    }
+
     // From BOSS_MIX_TIER onward a boss borrows another variant's pattern now and then.
     function pickAttack(b: Boss): BossAttack {
       if (b.tier < BOSS_MIX_TIER || b.volley % 3 !== 2) return b.variant.attack
@@ -918,41 +951,107 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
     function fireBoss(b: Boss) {
       const attack = pickAttack(b)
       b.attack = attack
-      const boost = b.shotSpeed
+      // Enraged bosses shoot faster — multiply base speed.
+      const boost = b.enraged ? b.shotSpeed * 1.35 : b.shotSpeed
+
+      // ── Universal crouch-punish override ─────────────────────────────────
+      // If the runner has been holding a crouch for too long, every boss fires a
+      // GROUND_LANE shot regardless of its normal attack pattern. The runner must jump
+      // or take the hit — crouching no longer saves them.
+      if (shouldPunishCrouch()) {
+        duckStreakFrames = 0
+        shots.push(makeShot(b.x, GROUND_LANE, { vx: 5 + boost, size: 10 }))
+        b.cooldown = Math.max(30, b.fireInterval - 20)
+        b.volley++
+        return
+      }
+
       if (attack === 'burst') {
-        // Rounds down one lane with a readable gap, then a long reload. Higher tiers add
-        // a third round, so the reload window the player relied on shrinks.
+        // Burst now alternates lanes every volley:
+        // — Even volleys: HIGH_LANE burst (duck to survive)
+        // — Odd volleys: LOW_LANE burst (jump to survive)
+        // This means a player cannot stay crouched through consecutive bursts.
         if (b.burst <= 0) {
           b.burst = b.tier >= 2 ? 3 : 2
-          // A three-round volley is only fair in the high lane, where one held crouch
-          // clears the whole burst. Three low rounds would demand three separate jumps
-          // inside the span of a single jump arc, which is not dodgeable at all.
-          b.burstHigh = b.burst >= 3 ? true : adaptiveHigh(b)
+          // Three-round volley: alternate high/low across the sequence instead of
+          // locking to one lane, so none of the three rounds can be ignored.
+          if (b.burst >= 3) {
+            // First round high, middle round low (ground-level), last round high again.
+            b.burstHigh = true  // overridden per-shot below
+          } else {
+            // Two rounds: volley parity decides the lane, punishing the dominant habit.
+            b.burstHigh = adaptiveHigh(b)
+          }
         }
-        shots.push(makeShot(b.x, b.burstHigh ? HIGH_LANE : LOW_LANE, { vx: 5.5 + boost }))
+        // Per-round lane decision for the 3-round sequence:
+        let shotY: number
+        if (b.burst === 2) {
+          // Round 1 of 3 — high, duck to clear
+          shotY = HIGH_LANE
+        } else if (b.burst === 1) {
+          // Round 2 of 3 — low/ground, must jump (cannot be crouched)
+          shotY = GROUND_LANE
+        } else {
+          // Round 3 (last) of 3, or round 2 of 2 — adaptive
+          shotY = b.burstHigh ? HIGH_LANE : LOW_LANE
+        }
+        shots.push(makeShot(b.x, shotY, { vx: 5.5 + boost }))
         b.burst--
-        b.cooldown = b.burst > 0 ? Math.max(20, 24 - b.tier) : b.fireInterval
+        b.cooldown = b.burst > 0 ? Math.max(18, 22 - b.tier) : b.fireInterval
       } else if (attack === 'drift') {
-        // Lobbed high and sinking — it settles into the standing lane, so it must be ducked.
+        // Drift: high arcing shot that settles into standing lane (duck to clear).
+        // Follow up immediately with a GROUND_LANE shot after a short delay so the
+        // runner cannot just stay crouched — they must stand to let the drift pass,
+        // then jump the ground shot.
         shots.push(makeShot(b.x, GROUND_Y - 64, { vx: 4.6 + boost, vy: 0.42, behavior: 'drift' }))
+        // Second low shot fired 28 frames behind the drift — when the drift is already
+        // committed to the standing lane the low arrives, forcing a late jump.
+        shots.push(makeShot(b.x - 28 * (4.6 + boost), GROUND_LANE, { vx: 4.2 + boost, size: 8 }))
         b.cooldown = b.fireInterval
       } else if (attack === 'split') {
-        // One round that clones itself midway: duck the leader, then jump the trailer.
+        // Split: the clone arrives in LOW_LANE. Add a leading HIGH_LANE shot so the
+        // sequence is: duck the leader → land → jump the clone. Crouching through
+        // everything is no longer safe because the clone occupies LOW_LANE.
         shots.push(makeShot(b.x, HIGH_LANE, { vx: 5 + boost, behavior: 'split' }))
+        // Extra trailing LOW shot arrives after the clone — forces a second jump.
+        if (b.tier >= 2) {
+          shots.push(makeShot(b.x - 60 * (5 + boost), GROUND_LANE, { vx: 4.8 + boost, size: 8 }))
+        }
         b.cooldown = b.fireInterval
       } else if (attack === 'flicker') {
-        // Jumps between lanes while travelling, then locks in with room left to react.
+        // Flicker now always fires TWO shots: one high (flicker) and one delayed low.
+        // The player must respond to the flicker's final lock-in AND then jump the low.
+        const high = adaptiveHigh(b)
         shots.push(
-          makeShot(b.x, adaptiveHigh(b) ? HIGH_LANE : LOW_LANE, {
-            vx: 5 + boost,
-            behavior: 'flicker',
-          }),
+          makeShot(b.x, high ? HIGH_LANE : LOW_LANE, { vx: 5 + boost, behavior: 'flicker' }),
+        )
+        // Low follow-up fires 36 frames staggered — arrives just as the flicker lands.
+        shots.push(
+          makeShot(b.x - 36 * (5 + boost), GROUND_LANE, { vx: 4.5 + boost, size: 8 }),
         )
         b.cooldown = b.fireInterval
       } else {
-        // Slow oversized wall — too tall to crouch under, so the only answer is a jump.
+        // Slab: a slow, oversized wall that must be jumped. Now followed by a fast LOW
+        // shot timed to arrive as the runner is descending — they cannot crouch-land
+        // safely because the low shot is already there.
         shots.push(makeShot(b.x, GROUND_Y - 22, { vx: 3 + boost * 0.5, size: 18 }))
+        // Fast low punisher arrives ~40 frames after the slab — when the jump is over.
+        shots.push(
+          makeShot(b.x - 40 * (3 + boost * 0.5), GROUND_LANE, { vx: 5.2 + boost, size: 9 }),
+        )
         b.cooldown = b.fireInterval
+      }
+      // ── Multishot: high-tier / enraged bosses add spread shots ──────────
+      // Fired AFTER the primary shot so the primary attack logic is unchanged.
+      const extras = extraShotCount(b)
+      if (extras > 0) {
+        const offsets = [20, -20, 36, -36]
+        for (let i = 0; i < extras; i++) {
+          const oy  = offsets[i % offsets.length]
+          const raw = (b.attack === 'slab' ? GROUND_Y - 22 : HIGH_LANE) + oy
+          const y   = Math.max(GROUND_Y - 60, Math.min(GROUND_Y - 8, raw))
+          shots.push(makeShot(b.x, y, { vx: 4.8 + boost + i * 0.5, size: 7 }))
+        }
       }
       b.volley++
     }
@@ -1494,7 +1593,7 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
           // reachable without grinding on random draws.
           const owed = BOSS_VARIANTS.filter((v) => (bossKills[v.label] ?? 0) < WIN_BOSS_EACH)
           const variant = pick(owed.length ? owed : BOSS_VARIANTS)
-          const tier = bossTier(score, bossesDefeated)
+          const tier = bossTier(score, bossesDefeated, frame)
           const scaled = scaleBoss(variant, tier)
           boss = {
             x: WIDTH + 40,
@@ -1514,9 +1613,11 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
             approachSpeed: scaled.approachSpeed,
             shotSpeed: scaled.shotSpeed,
             attack: variant.attack,
+            enraged: false,
           }
           dodgeDuckFrames = 0
           dodgeAirFrames = 0
+          duckStreakFrames = 0
           emit({ bossName: variant.label, bossHp: scaled.hp, bossMaxHp: scaled.hp, bossTier: tier })
         }
 
@@ -1539,11 +1640,33 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
           boss.animation = (boss.animation + 0.12) % v.frames.length
           boss.sprite = v.frames[Math.floor(boss.animation)]
           if (boss.x > v.targetX) boss.x -= boss.approachSpeed
-          // Sample the runner's evasion habit for adaptiveHigh().
+          // Sample the runner's evasion habit for adaptiveHigh() and crouch-punish detection.
           if (runner.onGround) {
-            if (ducking) dodgeDuckFrames++
-          } else dodgeAirFrames++
+            if (ducking) {
+              dodgeDuckFrames++
+              duckStreakFrames++
+            } else {
+              // Standing resets the streak — only sustained crouching is punished.
+              duckStreakFrames = 0
+            }
+          } else {
+            dodgeAirFrames++
+            // Jumping also resets the streak.
+            duckStreakFrames = 0
+          }
           boss.y = v.spawnY + Math.sin(boss.t / v.bobRate) * v.bobAmplitude
+
+          // ── Rage mode: triggers once when HP drops to ≤50 % ───────────────
+          if (!boss.enraged && boss.hp <= Math.floor(boss.maxHp * 0.5)) {
+            boss.enraged = true
+            // Rush the player harder in rage phase.
+            boss.approachSpeed = Math.min(boss.approachSpeed * 1.45, boss.approachSpeed + 5)
+            // Fire interval drops by 35 % in rage phase.
+            boss.fireInterval  = Math.max(28, Math.floor(boss.fireInterval * 0.65))
+            // Clear any pending cooldown so the rage burst fires immediately.
+            boss.cooldown = Math.min(boss.cooldown, 10)
+          }
+
           boss.cooldown--
           if (boss.cooldown <= 0) fireBoss(boss)
           const bBox = {

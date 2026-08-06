@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState, useCallback } from 'react'
 import RuvyxaRunner, { type DuoConfig } from './components/ruvyxa-runner'
+import { RtcPeer } from './components/rtc-peer'
 
 /* ─────────────────────────────────────────────────────────────────────────────
    Helper: generate a 6-char alphanumeric room code
@@ -35,10 +36,12 @@ export default function Home() {
   const [duoStep,    setDuoStep]    = useState<DuoStep>('off')
   const [roomCode,   setRoomCode]   = useState('')
   const [joinInput,  setJoinInput]  = useState('')
-  const [peerStatus, setPeerStatus] = useState<'idle' | 'waiting' | 'connected' | 'error'>('idle')
+  const [peerStatus, setPeerStatus] = useState<
+    'idle' | 'creating' | 'signaling' | 'connecting' | 'connected' | 'error'
+  >('idle')
 
-  /* BroadcastChannel ref */
-  const channelRef = useRef<BroadcastChannel | null>(null)
+  /* Peer ref — holds RtcPeer for online or nothing for local */
+  const peerRef = useRef<{ close(): void } | null>(null)
   const [duoConfig, setDuoConfig]   = useState<DuoConfig | null>(null)
 
   /* ── Listen to game-loop events ── */
@@ -72,50 +75,67 @@ export default function Home() {
     return () => window.removeEventListener('ruvy-state', handler)
   }, [])
 
-  /* ── BroadcastChannel helpers ── */
-  const openChannel = useCallback((code: string) => {
-    if (channelRef.current) channelRef.current.close()
-    const ch = new BroadcastChannel(`ruvy-duo-${code}`)
-    channelRef.current = ch
-    return ch
-  }, [])
+  /* ── WebRTC helpers ── */
+
+  /** Close any existing peer/channel before opening a new one. */
+  function closePeer() {
+    peerRef.current?.close()
+    peerRef.current = null
+  }
 
   const startHost = useCallback(() => {
     const code = makeCode()
     setRoomCode(code)
-    const ch = openChannel(code)
-    setPeerStatus('waiting')
-    ch.onmessage = (e) => {
-      if (e.data?.type === 'join-request') {
-        ch.postMessage({ type: 'join-ack' })
-        setPeerStatus('connected')
-        setDuoConfig({ mode: 'tab', slot: 1, channel: ch })
-        setDuoStep('connected')
-        setIsDuo(true)
-      }
-    }
+    setPeerStatus('creating')
     setDuoStep('hosting')
-  }, [openChannel])
+
+    // Register the room on the signaling server so the joiner can find it.
+    fetch('/api/signal', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ op: 'create', code }),
+    }).catch(() => {})
+
+    closePeer()
+    const peer = new RtcPeer(code, 1)
+    peerRef.current = peer
+    setPeerStatus('signaling')
+
+    peer.onopen = () => {
+      setPeerStatus('connected')
+      setDuoConfig({ mode: 'rtc', slot: 1, channel: peer })
+      setDuoStep('connected')
+      setIsDuo(true)
+    }
+    peer.onerror = () => {
+      setPeerStatus('error')
+      peer.close()
+    }
+  }, [])
 
   const joinRoom = useCallback(() => {
     const code = joinInput.trim().toUpperCase()
-    if (code.length < 4) return
-    const ch = openChannel(code)
-    setPeerStatus('waiting')
-    ch.postMessage({ type: 'join-request' })
-    const timeout = setTimeout(() => setPeerStatus('error'), 15_000)
-    ch.onmessage = (e) => {
-      if (e.data?.type === 'join-ack') {
-        clearTimeout(timeout)
-        setPeerStatus('connected')
-        setDuoConfig({ mode: 'tab', slot: 2, channel: ch })
-        setDuoStep('connected')
-        setIsDuo(true)
-        setRoomCode(code)
-      }
-    }
+    if (code.length < 6) return
+
+    closePeer()
+    setPeerStatus('signaling')
     setDuoStep('joining')
-  }, [joinInput, openChannel])
+    setRoomCode(code)
+
+    const peer = new RtcPeer(code, 2)
+    peerRef.current = peer
+
+    peer.onopen = () => {
+      setPeerStatus('connected')
+      setDuoConfig({ mode: 'rtc', slot: 2, channel: peer })
+      setDuoStep('connected')
+      setIsDuo(true)
+    }
+    peer.onerror = () => {
+      setPeerStatus('error')
+      peer.close()
+    }
+  }, [joinInput])
 
   const startLocalDuo = useCallback(() => {
     setDuoConfig({ mode: 'local' })
@@ -124,8 +144,7 @@ export default function Home() {
   }, [])
 
   const exitDuo = useCallback(() => {
-    channelRef.current?.close()
-    channelRef.current = null
+    closePeer()
     setDuoConfig(null)
     setDuoStep('off')
     setIsDuo(false)
@@ -312,7 +331,8 @@ export default function Home() {
                 </div>
 
                 <div className="duo-modal-note">
-                  Online rooms use BroadcastChannel — both tabs must be in the same browser.
+                  🌐 Online rooms use WebRTC — works across devices on any network.
+                  Both players open this page, then share the room code.
                 </div>
               </div>
             )}
@@ -320,11 +340,16 @@ export default function Home() {
             {duoStep === 'hosting' && (
               <div className="duo-modal-body">
                 <div className="duo-status-icon">📡</div>
-                <div className="duo-status-text">Waiting for friend to join…</div>
+                <div className="duo-status-text">
+                  {peerStatus === 'creating'  ? 'Creating room…' :
+                   peerStatus === 'signaling' ? '🔄 Waiting for friend to join…' :
+                   peerStatus === 'error'     ? '❌ Connection failed. Try again.' :
+                   'Waiting for friend to join…'}
+                </div>
                 <div className="duo-room-code">{roomCode}</div>
                 <div className="duo-room-label">ROOM CODE — share with your friend</div>
                 <div className="duo-pulse-ring" />
-                <button className="duo-cancel-btn" onClick={() => setDuoStep('menu')}>← Back</button>
+                <button className="duo-cancel-btn" onClick={() => { setDuoStep('menu'); setPeerStatus('idle'); peerRef.current?.close() }}>← Back</button>
               </div>
             )}
 
@@ -332,23 +357,31 @@ export default function Home() {
               <div className="duo-modal-body">
                 <div className="duo-status-icon">🔗</div>
                 <div className="duo-status-text">
-                  {peerStatus === 'waiting' ? 'Connecting…' :
-                   peerStatus === 'error'   ? '❌ Room not found. Check the code.' :
+                  {peerStatus === 'signaling'   ? '🔄 Exchanging connection info…' :
+                   peerStatus === 'connecting'  ? '⚡ Establishing P2P link…' :
+                   peerStatus === 'error'       ? '❌ Room not found or timed out.' :
                    'Enter the room code from your friend'}
                 </div>
-                <input
-                  className="duo-code-input"
-                  placeholder="XXXXXX"
-                  maxLength={6}
-                  value={joinInput}
-                  onChange={(e) => setJoinInput(e.target.value.toUpperCase())}
-                  onKeyDown={(e) => e.key === 'Enter' && joinRoom()}
-                  autoFocus
-                />
-                <button className="duo-join-btn" onClick={joinRoom} disabled={joinInput.length < 4}>
-                  JOIN ROOM →
-                </button>
-                <button className="duo-cancel-btn" onClick={() => { setDuoStep('menu'); setPeerStatus('idle') }}>
+                {(peerStatus === 'idle' || peerStatus === 'error') && (
+                  <>
+                    <input
+                      className="duo-code-input"
+                      placeholder="XXXXXX"
+                      maxLength={6}
+                      value={joinInput}
+                      onChange={(e) => setJoinInput(e.target.value.toUpperCase())}
+                      onKeyDown={(e) => e.key === 'Enter' && joinRoom()}
+                      autoFocus
+                    />
+                    <button className="duo-join-btn" onClick={joinRoom} disabled={joinInput.length < 6}>
+                      JOIN ROOM →
+                    </button>
+                  </>
+                )}
+                {peerStatus === 'signaling' && (
+                  <div className="duo-pulse-ring" />
+                )}
+                <button className="duo-cancel-btn" onClick={() => { setDuoStep('menu'); setPeerStatus('idle'); peerRef.current?.close() }}>
                   ← Back
                 </button>
               </div>
