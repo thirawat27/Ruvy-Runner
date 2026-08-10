@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 💬 Discussions
+    url: https://github.com/thirawat27/ruvy-runner/discussions
+    about: Ask questions, share runs and high scores, or discuss ideas here.
+  - name: 🐙 Ruvyxa Framework
+    url: https://github.com/thirawat27/Ruvyxa/issues
+    about: Report issues with the Ruvyxa framework itself, not this project.

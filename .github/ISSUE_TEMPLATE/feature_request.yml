@@ -1,0 +1,50 @@
+name: ✨ Feature request
+description: Suggest a new feature or improvement for Ruvy-Runner
+title: "[Feature]: "
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for sharing your idea! To help us design the right feature, describe the
+        **problem** you're solving — not just the solution you have in mind.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What is missing or frustrating today?
+      placeholder: e.g. "There is no way to play with more than two players online."
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: How do you imagine it working?
+      placeholder: e.g. "A 'create lobby' mode that supports up to 4 players..."
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any workarounds or alternative designs you've thought about?
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of the project does this affect?
+      options:
+        - Gameplay / game balance
+        - New boss / enemy / obstacle
+        - Sprites & art
+        - DUO MODE / networking (WebRTC)
+        - HUD / UI / UX
+        - Documentation
+        - Build / config / deployment
+        - Other
+  - type: textarea
+    id: notes
+    attributes:
+      label: Additional context
+      description: Anything else that would help us evaluate this idea?
