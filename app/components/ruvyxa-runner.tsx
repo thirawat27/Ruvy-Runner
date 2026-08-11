@@ -469,7 +469,14 @@ const BOUNTY_SPRITE = ['000A000', '00AAA00', '0AAAAA0', '00AAA00', '000A000']
 // Background palettes the run cycles through as score climbs. resolveTheme() holds each
 // steady, then cross-fades into the next only in its final stretch, so the shift reads as
 // gradual rather than a hard cut when the milestone hits.
+type DistrictTerrain = 'flats' | 'stacks' | 'lattice' | 'tide'
+type DistrictModifier = 'ammo' | 'bounty' | 'link' | 'shield'
+
 type Theme = {
+  name: string
+  terrain: DistrictTerrain
+  modifier: DistrictModifier
+  modifierLabel: string
   skyTop: string
   skyBottom: string
   hill: string
@@ -482,6 +489,10 @@ type Theme = {
 
 const THEMES: Theme[] = [
   {
+    name: 'SIGNAL FLATS',
+    terrain: 'flats',
+    modifier: 'ammo',
+    modifierLabel: 'FAST AMMO',
     skyTop: '#eef2ff',
     skyBottom: '#ffffff',
     hill: '#e5e5e5',
@@ -492,6 +503,10 @@ const THEMES: Theme[] = [
     night: false,
   },
   {
+    name: 'EMBER STACKS',
+    terrain: 'stacks',
+    modifier: 'bounty',
+    modifierLabel: 'MORE BOUNTIES',
     skyTop: '#fed7aa',
     skyBottom: '#fff1e6',
     hill: '#fdba74',
@@ -502,6 +517,10 @@ const THEMES: Theme[] = [
     night: false,
   },
   {
+    name: 'NIGHT LATTICE',
+    terrain: 'lattice',
+    modifier: 'link',
+    modifierLabel: 'LONGER LINK',
     skyTop: '#1e1b4b',
     skyBottom: '#312e81',
     hill: '#4338ca',
@@ -512,6 +531,10 @@ const THEMES: Theme[] = [
     night: true,
   },
   {
+    name: 'TIDAL MAINFRAME',
+    terrain: 'tide',
+    modifier: 'shield',
+    modifierLabel: 'EXTRA FIREWALL',
     skyTop: '#052e2b',
     skyBottom: '#0f766e',
     hill: '#115e59',
@@ -523,12 +546,17 @@ const THEMES: Theme[] = [
   },
 ]
 
-const THEME_STEP = 400
+// A district now lasts about two minutes of baseline survival instead of the old ~40 seconds.
+const THEME_STEP = 1_200
 
 // Autopilot planner: how far ahead a committed action may be deferred, and which actions
 // are worth deferring. Deferral has to cover a full jump arc (~38 frames) plus slack.
 const AI_MAX_DELAY = 36
-const AI_ACTIONS = ['duck', 'jump'] as const
+const AI_ACTIONS = ['duck', 'jump', 'duckJump'] as const
+const BOSS_MIN_X = 360
+const BOSS_MAX_X = 550
+const BOSS_MIN_Y = 86
+const BOSS_MAX_Y = 156
 
 // Tier rises with mastery (bosses beaten), raw distance (score), AND time played.
 // From tier 3 onward a boss starts mixing in another variant's attack.
@@ -597,6 +625,11 @@ function resolveTheme(score: number) {
   const progress = (score % THEME_STEP) / THEME_STEP
   const t = Math.max(0, (progress - 0.7) / 0.3)
   return {
+    index: idx,
+    name: a.name,
+    terrain: a.terrain,
+    modifier: a.modifier,
+    modifierLabel: a.modifierLabel,
     skyTop: lerpColor(a.skyTop, b.skyTop, t),
     skyBottom: lerpColor(a.skyBottom, b.skyBottom, t),
     hill: lerpColor(a.hill, b.hill, t),
@@ -625,6 +658,7 @@ type Shot = {
 type Particle = { x: number; y: number; vx: number; vy: number; life: number }
 // Every boss owns a different attack, so learning one fight never solves the next.
 type BossAttack = 'burst' | 'drift' | 'split' | 'flicker' | 'slab'
+type BossIntent = 'anchor' | 'flank' | 'rise' | 'dive'
 type BossVariant = {
   label: string
   frames: string[][]
@@ -657,6 +691,11 @@ type Boss = {
   approachSpeed: number
   shotSpeed: number
   attack: BossAttack
+  targetX: number
+  anchorY: number
+  targetY: number
+  moveCooldown: number
+  intent: BossIntent
   phase: number
   hitChain: number
   hitChainTimer: number
@@ -768,6 +807,12 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
     let netTick      = 0
     const random = isTabDuo ? createSeededRandom(duo?.seed ?? 'ruvy-duo') : Math.random
     const scoreMode: ScoreMode = isLocalDuo ? 'local-duo' : isTabDuo ? 'online-duo' : 'solo'
+    let districtIndex = 0
+    let districtNoticeFrames = 0
+
+    function activeDistrict() {
+      return THEMES[districtIndex]
+    }
 
     function sendDuoAction(action: DuoAction) {
       if (isTabDuo && duo?.channel) duo.channel.postMessage(action)
@@ -846,6 +891,8 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
       rewardText = ''
       rewardTimer = 0
       nextBountyAt = 180
+      districtIndex = 0
+      districtNoticeFrames = 0
       dodgeDuckFrames = 0
       dodgeAirFrames = 0
       duckStreakFrames = 0
@@ -1002,6 +1049,44 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
       return duckStreakFrames >= 40
     }
 
+    /** Chooses the boss's next bounded hover position without consuming random state. */
+    function chooseBossPosition(b: Boss) {
+      const cycle = (b.volley + b.phase * 2 + Math.floor(b.t / 84)) % 4
+      // Remote input does not arrive at the same frame on both peers, so online Duo uses
+      // only the shared boss state. Solo can also lean into the player's dominant dodge.
+      const airHeavy = !isTabDuo && dodgeAirFrames > dodgeDuckFrames + 18
+      const intent = airHeavy && cycle === 1 ? 'dive' : (['anchor', 'flank', 'rise', 'dive'] as const)[cycle]
+      b.intent = intent
+      if (intent === 'flank') {
+        b.targetX = BOSS_MAX_X
+        b.targetY = b.variant.spawnY - 14
+      } else if (intent === 'rise') {
+        b.targetX = BOSS_MIN_X + 42
+        b.targetY = BOSS_MIN_Y + b.phase * 8
+      } else if (intent === 'dive') {
+        b.targetX = BOSS_MIN_X + 78
+        b.targetY = BOSS_MAX_Y - b.phase * 5
+      } else {
+        b.targetX = b.variant.targetX
+        b.targetY = b.variant.spawnY
+      }
+      b.moveCooldown = Math.max(42, 86 - b.phase * 12)
+    }
+
+    /** Moves the boss toward its chosen hover point while keeping every lane readable. */
+    function updateBossPosition(b: Boss) {
+      if (b.x > b.variant.targetX) {
+        b.x = Math.max(b.variant.targetX, b.x - b.approachSpeed)
+        return
+      }
+      if (b.moveCooldown-- <= 0) chooseBossPosition(b)
+      const horizontalRate = 0.72 + b.phase * 0.16
+      const verticalRate = 0.46 + b.phase * 0.12
+      b.x += Math.sign(b.targetX - b.x) * Math.min(horizontalRate, Math.abs(b.targetX - b.x))
+      b.anchorY += Math.sign(b.targetY - b.anchorY) * Math.min(verticalRate, Math.abs(b.targetY - b.anchorY))
+      b.y = b.anchorY + Math.sin(b.t / b.variant.bobRate) * b.variant.bobAmplitude * 0.45
+    }
+
     // How many extra parallel shots a boss fires per volley based on tier.
     // Gives high-tier bosses genuine pressure even against experienced players.
     function extraShotCount(b: Boss): number {
@@ -1032,6 +1117,7 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
         shots.push(makeShot(b.x, GROUND_LANE, { vx: 5 + boost, size: 10 }))
         b.cooldown = Math.max(30, b.fireInterval - 20)
         b.volley++
+        b.moveCooldown = Math.min(b.moveCooldown, 28)
         return
       }
 
@@ -1123,6 +1209,7 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
         }
       }
       b.volley++
+      b.moveCooldown = Math.min(b.moveCooldown, b.burst > 0 ? 28 : 0)
     }
 
     /** Fires a readable two-lane reply after players try to stun-lock the boss. */
@@ -1135,6 +1222,7 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
       shots.push(makeShot(b.x - 26 * (4.8 + boost), GROUND_LANE, { vx: 4.8 + boost, size: 8 }))
       b.cooldown = Math.max(24, Math.floor(b.fireInterval * 0.65))
       b.volley++
+      b.moveCooldown = 0
       rewardText = 'COUNTERMEASURE — DUCK, THEN JUMP'
       rewardTimer = 105
     }
@@ -1153,6 +1241,7 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
       b.hitChainTimer = 84
       // A hit earns a brief stagger, not the old one-second attack cancel.
       b.cooldown = Math.max(b.cooldown, 16)
+      b.moveCooldown = Math.min(b.moveCooldown, 18)
 
       if (b.hp > 0 && b.hitChain >= 3) triggerCountermeasure(b)
 
@@ -1292,14 +1381,16 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
       score += isBounty ? 100 : 25
       purged++
       combo = comboWindow > 0 ? combo + 1 : 1
-      comboWindow = 210
+      comboWindow = activeDistrict().modifier === 'link' ? 285 : 210
       rewardText = isBounty ? 'PRIORITY PURGED +100' : `LINK ${combo}/3`
       rewardTimer = 75
 
       if (combo >= 3) {
         combo = 0
         comboWindow = 0
-        shieldCharges = Math.min(2, shieldCharges + 1)
+        // Keep the normal two-charge recovery intact; Tidal Mainframe extends it by one.
+        const shieldLimit = activeDistrict().modifier === 'shield' ? 3 : 2
+        shieldCharges = Math.min(shieldLimit, shieldCharges + 1)
         surgeFrames = Math.max(surgeFrames, 300)
         rewardText = 'FIREWALL ONLINE · OVERCLOCK'
         rewardTimer = 150
@@ -1329,24 +1420,65 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
         ctx!.fillRect(s.x, s.y, s.size, s.size)
       }
       for (const s of scenery) {
-        if (s.kind === 'cloud') drawSprite(CLOUD_SPRITE, s.x, s.y, s.size, theme.cloud)
+        if (s.kind === 'cloud' && theme.terrain !== 'lattice') {
+          drawSprite(CLOUD_SPRITE, s.x, s.y, s.size, theme.cloud)
+        }
       }
       for (const s of scenery) {
         if (s.kind !== 'tower') continue
         ctx!.fillStyle = theme.tower
-        const w = Math.max(10, Math.floor(s.size * 0.55))
-        ctx!.fillRect(s.x, GROUND_Y - s.size, w, s.size)
+        if (theme.terrain === 'stacks') {
+          const w = Math.max(14, Math.floor(s.size * 0.8))
+          const h = Math.round(s.size * 1.55)
+          ctx!.fillRect(s.x, GROUND_Y - h, w, h)
+          ctx!.fillStyle = theme.cloud
+          for (let y = GROUND_Y - h + 10; y < GROUND_Y - 6; y += 12) {
+            ctx!.fillRect(s.x + 3, y, Math.max(3, w - 7), 2)
+          }
+        } else if (theme.terrain === 'lattice') {
+          const w = Math.max(6, Math.floor(s.size * 0.26))
+          ctx!.fillRect(s.x, GROUND_Y - s.size * 0.9, w, s.size * 0.9)
+        } else if (theme.terrain === 'flats') {
+          const w = Math.max(10, Math.floor(s.size * 0.55))
+          ctx!.fillRect(s.x, GROUND_Y - s.size, w, s.size)
+        }
       }
       for (const s of scenery) {
         if (s.kind !== 'hill') continue
         ctx!.fillStyle = theme.hill
-        const steps = 5
-        const stepW = Math.max(4, Math.floor(s.size / steps))
-        for (let i = 0; i < steps; i++) {
-          const h = Math.round((s.size * (i + 1)) / steps)
-          ctx!.fillRect(s.x + i * stepW, GROUND_Y - h, stepW, h)
-          ctx!.fillRect(s.x + (steps * 2 - i - 1) * stepW, GROUND_Y - h, stepW, h)
+        if (theme.terrain === 'flats') {
+          const steps = 5
+          const stepW = Math.max(4, Math.floor(s.size / steps))
+          for (let i = 0; i < steps; i++) {
+            const h = Math.round((s.size * (i + 1)) / steps)
+            ctx!.fillRect(s.x + i * stepW, GROUND_Y - h, stepW, h)
+            ctx!.fillRect(s.x + (steps * 2 - i - 1) * stepW, GROUND_Y - h, stepW, h)
+          }
+        } else if (theme.terrain === 'tide') {
+          const waveWidth = Math.max(30, s.size * 2.2)
+          for (let x = 0; x < waveWidth; x += 7) {
+            const y = GROUND_Y - 26 + Math.round(Math.sin((x + s.x) / 11) * 8)
+            ctx!.fillRect(s.x + x, y, 8, 4)
+          }
         }
+      }
+      if (theme.terrain === 'lattice') {
+        ctx!.strokeStyle = theme.cloud
+        ctx!.globalAlpha = 0.42
+        ctx!.lineWidth = 1
+        for (let y = GROUND_Y - 14; y > 54; y -= 12) {
+          ctx!.beginPath()
+          ctx!.moveTo(0, y)
+          ctx!.lineTo(WIDTH, y)
+          ctx!.stroke()
+        }
+        for (let x = -WIDTH; x <= WIDTH * 2; x += 74) {
+          ctx!.beginPath()
+          ctx!.moveTo(WIDTH / 2, GROUND_Y)
+          ctx!.lineTo(x, 50)
+          ctx!.stroke()
+        }
+        ctx!.globalAlpha = 1
       }
       for (const s of scenery) {
         if (s.kind !== 'bird') continue
@@ -1394,7 +1526,9 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
     function snapshotThreats(): SimThreat[] {
       const list: SimThreat[] = []
       for (const o of obstacles) {
-        if (o.hp <= 0) continue
+        // Priority Bounties are optional score targets, not collision hazards. Treating
+        // them as lethal made the Autopilot dodge a safe packet into a real threat.
+        if (o.hp <= 0 || o.kind === 'bounty') continue
         list.push({
           x: o.x + 2,
           y: o.y + 2,
@@ -1455,7 +1589,7 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
       return born.length ? list.concat(born) : list
     }
 
-    type AiAction = 'none' | 'jump' | 'duck'
+    type AiAction = 'none' | 'jump' | 'duck' | 'duckJump'
 
     function cloneThreats(base: SimThreat[]): SimThreat[] {
       const out: SimThreat[] = new Array(base.length)
@@ -1491,7 +1625,7 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
       horizon: number,
       pad: number,
     ): number {
-      if (action === 'jump' && delay === 0 && !runner.onGround) return -1
+      if ((action === 'jump' || action === 'duckJump') && delay === 0 && !runner.onGround) return -1
       let ry = runner.y
       let rvy = runner.vy
       let onGround = runner.onGround
@@ -1500,12 +1634,13 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
 
       for (let f = 0; f < horizon; f++) {
         const active = f >= delay
-        if (action === 'jump' && active && !jumped && onGround) {
+        const jumpAt = delay
+        if ((action === 'jump' || action === 'duckJump') && f >= jumpAt && !jumped && onGround) {
           rvy = JUMP_VELOCITY
           onGround = false
           jumped = true
         }
-        const duckHeld = action === 'duck' && active
+        const duckHeld = action === 'duck' && active || action === 'duckJump' && f < jumpAt
         rvy += GRAVITY
         if (duckHeld && !onGround) rvy += 0.7
         ry += rvy
@@ -1565,9 +1700,8 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
         }
         if (b && b.hp > 0) {
           bossT++
-          if (bossX > b.variant.targetX) bossX -= b.variant.approachSpeed
-          const bossY =
-            b.variant.spawnY + Math.sin(bossT / b.variant.bobRate) * b.variant.bobAmplitude
+          if (bossX > b.targetX) bossX -= b.approachSpeed
+          const bossY = b.anchorY + Math.sin(bossT / b.variant.bobRate) * b.variant.bobAmplitude * 0.45
           const bossBox = {
             x: bossX,
             y: bossY,
@@ -1621,7 +1755,9 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
           for (const action of AI_ACTIONS) {
             const score = simulatePlan(base, action, delay, horizon, padding)
             if (score < 0) continue
-            const immediate: AiAction = delay === 0 ? action : 'none'
+            const immediate: AiAction = action === 'duckJump'
+              ? delay === 0 ? 'jump' : 'duck'
+              : delay === 0 ? action : 'none'
             const pref = immediate === 'none' ? 0 : immediate === 'duck' ? 1 : 2
             if (score > bestScore || (score === bestScore && pref < bestPref)) {
               bestScore = score
@@ -1669,6 +1805,14 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
 
       ctx!.clearRect(0, 0, WIDTH, HEIGHT)
       const theme = resolveTheme(score)
+      if (theme.index !== districtIndex) {
+        districtIndex = theme.index
+        if (started) {
+          districtNoticeFrames = 150
+          rewardText = `ENTERING ${theme.name} — ${theme.modifierLabel}`
+          rewardTimer = 150
+        }
+      }
       const sky = ctx!.createLinearGradient(0, 0, 0, HEIGHT)
       sky.addColorStop(0, theme.skyTop)
       sky.addColorStop(1, theme.skyBottom)
@@ -1702,6 +1846,7 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
         if (surgeFrames > 0) surgeFrames--
         if (invulnerableFrames > 0) invulnerableFrames--
         if (rewardTimer > 0) rewardTimer--
+        if (districtNoticeFrames > 0) districtNoticeFrames--
 
         for (const s of scenery) {
           const factor =
@@ -1731,7 +1876,10 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
 
         ammoTick++
         // Refill faster during a boss fight so the player is never stuck empty.
-        if (ammoTick >= (boss ? 40 : AMMO_REGEN)) {
+        const ammoRegenInterval = activeDistrict().modifier === 'ammo'
+          ? Math.round((boss ? 40 : AMMO_REGEN) * 0.72)
+          : (boss ? 40 : AMMO_REGEN)
+        if (ammoTick >= ammoRegenInterval) {
           ammoTick = 0
           const prevAmmo = ammo
           ammo = Math.min(MAX_AMMO, ammo + 1)
@@ -1788,6 +1936,11 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
             approachSpeed: scaled.approachSpeed,
             shotSpeed: scaled.shotSpeed,
             attack: variant.attack,
+            targetX: variant.targetX,
+            anchorY: variant.spawnY,
+            targetY: variant.spawnY,
+            moveCooldown: 72,
+            intent: 'anchor',
             phase: 0,
             hitChain: 0,
             hitChainTimer: 0,
@@ -1808,7 +1961,8 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
           }
           if (score >= nextBountyAt) {
             spawnBounty()
-            nextBountyAt = score + 210 + Math.floor(random() * 110)
+            const bountyGap = activeDistrict().modifier === 'bounty' ? 150 : 210
+            nextBountyAt = score + bountyGap + Math.floor(random() * 110)
           }
         }
 
@@ -1825,7 +1979,7 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
           // Four-frame loop, advanced on the fixed step so every boss idles at the same tempo.
           boss.animation = (boss.animation + 0.12) % v.frames.length
           boss.sprite = v.frames[Math.floor(boss.animation)]
-          if (boss.x > v.targetX) boss.x -= boss.approachSpeed
+          updateBossPosition(boss)
           // Sample the runner's evasion habit for adaptiveHigh() and crouch-punish detection.
           if (runner.onGround) {
             if (ducking) {
@@ -1840,8 +1994,6 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
             // Jumping also resets the streak.
             duckStreakFrames = 0
           }
-          boss.y = v.spawnY + Math.sin(boss.t / v.bobRate) * v.bobAmplitude
-
           // ── Rage mode: triggers once when HP drops to ≤50 % ───────────────
           if (!boss.enraged && boss.hp <= Math.floor(boss.maxHp * 0.5)) {
             boss.enraged = true
@@ -2119,6 +2271,17 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
         ctx!.fillRect(52 + i * 12, 15, 8, 10)
       }
 
+      ctx!.fillStyle = hudMuted
+      ctx!.font = "9px 'SFMono-Regular', Consolas, monospace"
+      ctx!.fillText(`DISTRICT ${theme.name} · ${theme.modifierLabel}`, 20, 96)
+      if (districtNoticeFrames > 0) {
+        ctx!.fillStyle = theme.cloud
+        ctx!.font = "13px 'SFMono-Regular', Consolas, monospace"
+        ctx!.textAlign = 'center'
+        ctx!.fillText(`// ${theme.name} //`, WIDTH / 2, 72)
+        ctx!.textAlign = 'left'
+      }
+
       if (comboWindow > 0) {
         ctx!.fillStyle = '#fbbf24'
         ctx!.font = "10px 'SFMono-Regular', Consolas, monospace"
@@ -2157,6 +2320,9 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
           ctx!.font = "9px 'SFMono-Regular', Consolas, monospace"
           ctx!.fillText('COUNTERMEASURE', 20, 50)
         }
+        ctx!.fillStyle = hudMuted
+        ctx!.font = "9px 'SFMono-Regular', Consolas, monospace"
+        ctx!.fillText(`INTENT ${boss.intent.toUpperCase()}`, 20, boss.guardFrames > 0 ? 63 : 50)
       }
 
       if (!started || gameOver) {

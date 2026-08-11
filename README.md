@@ -26,12 +26,13 @@ itself can live as a single self-contained Canvas component.
 - **Boss tier system** — bosses get tougher the longer you survive: more HP, faster fire
   rate, aggressive approach speed, and mixed-in attacks from other variants.
 - **Rage mode** — bosses enrage at ≤50 % HP, boosting their fire rate and approach speed.
-- **Adaptive AI** — bosses learn your habits: crouch too much and they fire ground shots you
-  must jump; jump too much and they aim high.
-- **Dynamic themes** — the palette shifts between four day/night biomes as your score climbs
-  (indigo dawn → sunset → violet night → teal night), with cross-fades and twinkling stars.
-- **Autopilot AI** (`Alt+T`) — a simulation-based bot that plans jump/duck/shoot by rolling
-  the real physics forward, and adjusts its caution level run over run.
+- **Adaptive boss AI** — bosses learn your habits, alter their attack lane, and patrol between
+  flanking, rising, and diving hover points instead of parking in one position.
+- **Distinct districts** — every 1,200 score opens a new map silhouette: Signal Flats,
+  Ember Stacks, Night Lattice, or Tidal Mainframe. Each has a small assistive modifier
+  (faster ammo, more bounties, longer Link time, or extra Firewall capacity).
+- **Autopilot AI** (`Alt+T`) — a simulation-based bot that ignores harmless Bounties, plans
+  jump/duck and duck-then-jump responses, and adjusts its caution level run over run.
 - **DUO MODE** — local or online co-op on one shared route, with a shared score and fairer pacing (see below).
 - **Saved score board** — keeps the best five completed runs in the current browser, even after refresh.
 - **A real win state** — five objectives (score, boss kills, purges, overclock time, and a
@@ -117,7 +118,7 @@ over the peer-to-peer DataChannel.
 
 Every boss:
 
-- Bobs vertically so its hitbox crosses your firing line — a standing shot always can connect.
+- Patrols between bounded flank, rise, and dive hover points while keeping a readable firing lane.
 - Learns from you: crouch-heavy players draw low-lane fire, jump-heavy players draw high fire.
 - Punishes sustained crouching with a ground-level shot that can only be jumped.
 - Gains **multishot spread**, mixed attack patterns (from tier 3), and rage mode at low HP.
@@ -128,7 +129,7 @@ Every boss:
 
 - **Score** climbs with distance; **Best** is saved in the current browser and flashes on new records.
 - **Purges** count obstacles destroyed; **boss kills** track each variant.
-- Themes rotate every `400` score points across four palettes.
+- Districts rotate every `1,200` score points, with a long cross-fade before the next map.
 - **Link rewards** turn three quick purges into one Firewall charge and five seconds of
   Overclocked 2× distance score. Firewall absorbs one collision and then has a short
   invulnerability window, making it a recovery tool rather than permanent safety.
@@ -152,8 +153,8 @@ a single unbroken life**:
 
 Press `Alt+T` to hand control to the built-in bot. Instead of rule-of-thumb timings, it:
 
-1. Snapshots every threat (obstacles + boss shots) into a simulation.
-2. Evaluates candidate plans — "wait `N` frames, then commit to jump/duck" — by rolling the
+1. Snapshots only lethal threats (obstacles + boss shots) into a simulation.
+2. Evaluates candidate plans — "wait `N` frames, then commit to jump/duck or duck-then-jump" — by rolling the
    runner's real physics and hitboxes forward.
 3. Picks the plan that survives the longest, mirroring split-clone and flicker behavior
    exactly so it never mispredicts.
