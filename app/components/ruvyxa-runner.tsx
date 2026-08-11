@@ -1277,7 +1277,9 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
     function spawnBounty() {
       obstacles.push({
         x: WIDTH + 12,
-        y: GROUND_Y - 42,
+        // Standard bolts travel through the runner's mid/low lane (~GROUND_Y - 14).
+        // Keep the packet inside that lane so it is a deliberate, reachable shot.
+        y: GROUND_Y - 24,
         sprite: BOUNTY_SPRITE,
         kind: 'bounty',
         hp: 1,
