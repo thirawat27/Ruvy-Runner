@@ -44,8 +44,9 @@ export class RtcPeer {
 
   // ── Host side ──────────────────────────────────────────────────────────────
   private async initHost() {
-    // Unreliable, unordered channel — fastest for high-frequency game state.
-    const dc = this.pc.createDataChannel('ruvy-duo', { ordered: false, maxRetransmits: 0 })
+    // A shared deterministic world must receive every start, shot, restart, and defeat
+    // action in order. The payload is tiny, so correctness beats lossy state updates.
+    const dc = this.pc.createDataChannel('ruvy-duo', { ordered: true })
     this.setupDc(dc)
 
     const offer = await this.pc.createOffer()

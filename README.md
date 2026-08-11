@@ -17,8 +17,10 @@ itself can live as a single self-contained Canvas component.
   scenery, and animated sprites.
 - **Shoot or dodge** — obstacles are hazards, but bosses can be fought with a regenerating
   shot meter (3 shots, auto-recharge).
-- **Three obstacle families** — ground bugs, flying errors, and tall malware blocks force
-  different responses (jump, duck, or both).
+- **Priority bounty loop** — shoot gold packets and link three purges quickly to earn a
+  one-hit Firewall and a brief 2× score Overclock.
+- **Hazards and bounty targets** — ground bugs, flying errors, and tall malware blocks force
+  different responses, while gold packets create optional shooting objectives.
 - **Five unique bosses** — HACKER, HUMAN ERROR, VIRUS, SYSTEM GLITCH, and HARDWARE FAULT.
   Each has its own 4-frame sprite loop, color scheme, and attack pattern.
 - **Boss tier system** — bosses get tougher the longer you survive: more HP, faster fire
@@ -30,7 +32,8 @@ itself can live as a single self-contained Canvas component.
   (indigo dawn → sunset → violet night → teal night), with cross-fades and twinkling stars.
 - **Autopilot AI** (`Alt+T`) — a simulation-based bot that plans jump/duck/shoot by rolling
   the real physics forward, and adjusts its caution level run over run.
-- **DUO MODE** — three ways to play together (see below).
+- **DUO MODE** — local or online co-op on one shared route, with a shared score and fairer pacing (see below).
+- **Saved score board** — keeps the best five completed runs in the current browser, even after refresh.
 - **A real win state** — five objectives (score, boss kills, purges, overclock time, and a
   hidden marathon gate) that must be completed in a single unbroken run.
 
@@ -58,18 +61,19 @@ Open the **🎮 DUO MODE** menu from the HUD and pick a way to play:
 | Mode          | How it works                                                            |
 | ------------- | ----------------------------------------------------------------------- |
 | **LOCAL CO-OP** | Two runners on one keyboard. P1 uses `WASD + X`, P2 uses arrows + `↵`. Both share the same canvas and obstacles, each with their own ammo meter. |
-| **HOST A ROOM** | Creates a 6-character room code. Share it with a friend. |
-| **JOIN A ROOM** | Enter the room code from your host. |
+| **HOST A ROOM** | Creates a 6-character room code. Share it with a friend; the room starts one co-op run when either player starts. |
+| **JOIN A ROOM** | Enter a host's code to play the same seeded route, hazards, bosses, team score, and reset state. |
 
 Online rooms use **WebRTC** (`RtcPeer`):
 
 - A host creates a room on the signaling server and opens a DataChannel (`ruvy-duo`).
 - The joiner polls for the host's SDP offer, answers, and both sides establish a direct
   peer-to-peer connection through public Google STUN servers.
-- The DataChannel is **unordered and unreliable** (`ordered: false, maxRetransmits: 0`) —
-  the fastest transport for high-frequency game state.
-- Both peers render their own lane and mirror the partner's position, ammo, and score via a
-  tiny `runner-state` message.
+- The DataChannel is **ordered and reliable** because start, shot, reset, and defeat actions
+  must arrive in the same order for both copies of the shared route to stay in sync.
+- The room code seeds the obstacle and boss stream identically for both peers. Each player
+  still has an independent lane and ammo meter, while shots, hazards, team score, and a
+  team defeat/reset are shared.
 
 The peer is interface-compatible with `BroadcastChannel`, so the game can swap transports
 without any code changes — same tab, two tabs, or two devices.
@@ -99,6 +103,7 @@ over the peer-to-peer DataChannel.
 | Ground bugs        | Ground   | Jump        |
 | Flying errors      | Air      | Duck        |
 | Malware blocks     | Tall     | Jump (2 HP) |
+| Priority bounty    | Gold packet | Shoot for a large score boost; harmless if missed |
 
 ### Bosses
 
@@ -116,12 +121,17 @@ Every boss:
 - Learns from you: crouch-heavy players draw low-lane fire, jump-heavy players draw high fire.
 - Punishes sustained crouching with a ground-level shot that can only be jumped.
 - Gains **multishot spread**, mixed attack patterns (from tier 3), and rage mode at low HP.
+- Shifts through three health phases. Repeated fast hits trigger a visible **Countermeasure**
+  guard: shots briefly bounce off while the boss sends a high-then-ground reply to dodge.
 
 ## 🏆 Scoring & Objectives
 
-- **Score** climbs with distance; **Best** persists for the session and flashes on new records.
+- **Score** climbs with distance; **Best** is saved in the current browser and flashes on new records.
 - **Purges** count obstacles destroyed; **boss kills** track each variant.
 - Themes rotate every `400` score points across four palettes.
+- **Link rewards** turn three quick purges into one Firewall charge and five seconds of
+  Overclocked 2× distance score. Firewall absorbs one collision and then has a short
+  invulnerability window, making it a recovery tool rather than permanent safety.
 
 There is no finish line you can run to. Winning requires completing **all five objectives in
 a single unbroken life**:
@@ -207,8 +217,10 @@ ruvy-runner/
 │   │   └── signal/
 │   │       └── route.ts          # WebRTC signaling server (create/offer/answer/poll)
 │   ├── components/
+│   │   ├── duo-protocol.ts       # Typed Duo transport and gameplay messages
 │   │   ├── rtc-peer.ts           # WebRTC DataChannel peer (BroadcastChannel-compatible)
-│   │   └── ruvyxa-runner.tsx     # The entire game: engine, sprites, bosses, AI, rendering
+│   │   ├── score-storage.ts      # Browser-local top-five score persistence
+│   │   └── ruvyxa-runner.tsx     # Canvas engine, rendering, and input wiring
 │   ├── globals.css               # Global styles (HUD, duo modal, layout)
 │   ├── layout.tsx                # Root layout + metadata
 │   └── page.tsx                  # Home route: HUD, duo menu, WebRTC wiring

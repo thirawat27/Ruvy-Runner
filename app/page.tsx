@@ -1,8 +1,10 @@
 'use client'
 
 import { useEffect, useRef, useState, useCallback } from 'react'
-import RuvyxaRunner, { type DuoConfig } from './components/ruvyxa-runner'
+import RuvyxaRunner from './components/ruvyxa-runner'
+import { type DuoConfig } from './components/duo-protocol'
 import { RtcPeer } from './components/rtc-peer'
+import { loadScoreHistory, type ScoreRecord } from './components/score-storage'
 
 /* ─────────────────────────────────────────────────────────────────────────────
    Helper: generate a 6-char alphanumeric room code
@@ -30,7 +32,7 @@ export default function Home() {
   const [bossTierN,  setBossTierN]  = useState(0)
   const [isNewBest,  setIsNewBest]  = useState(false)
   const [isDuo,      setIsDuo]      = useState(false)
-  const [remoteScore, setRemoteScore] = useState(0)
+  const [scoreHistory, setScoreHistory] = useState<ScoreRecord[]>([])
 
   /* DUO modal state */
   const [duoStep,    setDuoStep]    = useState<DuoStep>('off')
@@ -46,6 +48,7 @@ export default function Home() {
 
   /* ── Listen to game-loop events ── */
   useEffect(() => {
+    setScoreHistory(loadScoreHistory())
     const handler = (e: Event) => {
       const d = (e as CustomEvent).detail
       if (d.score  !== undefined) setScore(d.score)
@@ -65,7 +68,7 @@ export default function Home() {
       if (d.bossHp    !== undefined) setBossHp(d.bossHp as number)
       if (d.bossMaxHp !== undefined) setBossMaxHp(d.bossMaxHp as number)
       if (d.bossTier  !== undefined) setBossTierN(d.bossTier as number)
-      if (d.remoteScore !== undefined) setRemoteScore(d.remoteScore as number)
+      if (d.scoreHistory !== undefined) setScoreHistory(d.scoreHistory as ScoreRecord[])
       if (d.gameOver === true) {
         shellRef.current?.classList.add('flash')
         setTimeout(() => shellRef.current?.classList.remove('flash'), 500)
@@ -103,7 +106,7 @@ export default function Home() {
 
     peer.onopen = () => {
       setPeerStatus('connected')
-      setDuoConfig({ mode: 'rtc', slot: 1, channel: peer })
+      setDuoConfig({ mode: 'rtc', slot: 1, channel: peer, seed: code })
       setDuoStep('connected')
       setIsDuo(true)
     }
@@ -127,7 +130,7 @@ export default function Home() {
 
     peer.onopen = () => {
       setPeerStatus('connected')
-      setDuoConfig({ mode: 'rtc', slot: 2, channel: peer })
+      setDuoConfig({ mode: 'rtc', slot: 2, channel: peer, seed: code })
       setDuoStep('connected')
       setIsDuo(true)
     }
@@ -157,7 +160,6 @@ export default function Home() {
   const scoreStr = String(score).padStart(6, '0')
   const bestStr  = String(best).padStart(6, '0')
   const mySlot   = duoConfig?.slot ?? 1
-  const theirSlot = mySlot === 1 ? 2 : 1
   const hpPct    = bossMaxHp > 0 ? Math.max(0, (bossHp / bossMaxHp) * 100) : 0
   const maxAmmo  = 3
 
@@ -179,26 +181,15 @@ export default function Home() {
         <div className="hud-score-group">
           <div className="hud-stat">
             <div className="hud-stat-label" style={isDuo && duoStep === 'connected' ? { color: '#8b5cf6' } : undefined}>
-              {isDuo && duoStep === 'connected' ? `P${mySlot} SCORE` : 'Score'}
+              {isDuo && duoStep === 'connected' ? 'TEAM SCORE' : 'Score'}
             </div>
             <div className="hud-stat-value" style={isDuo && duoStep === 'connected' ? { color: '#8b5cf6' } : undefined}>
               {scoreStr}
             </div>
           </div>
-          {isDuo && duoStep === 'connected' && (
-            <>
-              <div className="hud-divider" />
-              <div className="hud-stat">
-                <div className="hud-stat-label" style={{ color: '#fb923c' }}>P{theirSlot} SCORE</div>
-                <div className="hud-stat-value" style={{ color: '#fb923c' }}>
-                  {String(remoteScore).padStart(6, '0')}
-                </div>
-              </div>
-            </>
-          )}
           <div className="hud-divider" />
           <div className="hud-stat">
-            <div className="hud-stat-label">Best</div>
+            <div className="hud-stat-label">Saved best</div>
             <div className={`hud-stat-value${isNewBest ? ' new-best' : ''}`}>{bestStr}</div>
           </div>
         </div>
@@ -249,6 +240,16 @@ export default function Home() {
         </div>
 
         <div className="hud-right">
+          {scoreHistory.length > 0 && (
+            <div className="saved-score-list" aria-label="Saved high scores">
+              <span className="saved-score-label">TOP</span>
+              {scoreHistory.slice(0, 3).map((record) => (
+                <span className="saved-score-item" key={`${record.playedAt}-${record.score}`}>
+                  {String(record.score).padStart(5, '0')}
+                </span>
+              ))}
+            </div>
+          )}
           {isDuo && duoStep === 'local' && (
             <div className="hud-ammo-group">
               <div className="hud-ammo">

@@ -1,11 +1,35 @@
 'use client'
 
 import { useEffect, useRef } from 'react'
+import {
+  type DuoConfig,
+  type DuoAction,
+  isDuoAction,
+  isRunnerStateMessage,
+} from './duo-protocol'
+import { getSavedBest, saveScore, type ScoreMode } from './score-storage'
+
+export type { DuoConfig } from './duo-protocol'
 
 // Broadcast game state to the React HUD in page.tsx
 function emit(detail: Record<string, unknown>) {
   if (typeof window !== 'undefined') {
     window.dispatchEvent(new CustomEvent('ruvy-state', { detail }))
+  }
+}
+
+/** Produces a stable room-specific random stream so online peers generate identical hazards. */
+function createSeededRandom(seed: string) {
+  let value = 2166136261
+  for (let index = 0; index < seed.length; index++) {
+    value = Math.imul(value ^ seed.charCodeAt(index), 16777619)
+  }
+  return () => {
+    value += 0x6d2b79f5
+    let mixed = value
+    mixed = Math.imul(mixed ^ (mixed >>> 15), mixed | 1)
+    mixed ^= mixed + Math.imul(mixed ^ (mixed >>> 7), mixed | 61)
+    return ((mixed ^ (mixed >>> 14)) >>> 0) / 4294967296
   }
 }
 
@@ -438,6 +462,9 @@ const BOSS_VARIANTS: BossVariant[] = [
 ]
 
 const CLOUD_SPRITE = ['000111000', '011111110', '111111111', '011111110']
+// A non-lethal priority packet. Shooting it feeds the short reward loop instead of adding
+// another obstacle the player simply has to memorize.
+const BOUNTY_SPRITE = ['000A000', '00AAA00', '0AAAAA0', '00AAA00', '000A000']
 
 // Background palettes the run cycles through as score climbs. resolveTheme() holds each
 // steady, then cross-fades into the next only in its final stretch, so the shift reads as
@@ -581,9 +608,9 @@ function resolveTheme(score: number) {
   }
 }
 
-type ObstacleKind = 'bug' | 'error' | 'malware'
+type ObstacleKind = 'bug' | 'error' | 'malware' | 'bounty'
 type Obstacle = { x: number; y: number; sprite: string[]; kind: ObstacleKind; hp: number }
-type Bolt = { x: number; y: number }
+type Bolt = { x: number; y: number; owner?: 1 | 2 }
 type ShotBehavior = 'straight' | 'drift' | 'split' | 'flicker'
 type Shot = {
   x: number
@@ -630,6 +657,10 @@ type Boss = {
   approachSpeed: number
   shotSpeed: number
   attack: BossAttack
+  phase: number
+  hitChain: number
+  hitChainTimer: number
+  guardFrames: number
   /** Set to true when HP drops to ≤50 % — triggers rage-mode fire rate and approach. */
   enraged: boolean
 }
@@ -638,21 +669,6 @@ type Scenery = {
   kind: 'cloud' | 'hill' | 'pebble' | 'tower' | 'star' | 'bird'
   y: number
   size: number
-}
-
-/** Minimal channel contract — satisfied by both BroadcastChannel and RtcPeer. */
-export interface ChannelLike {
-  postMessage(data: unknown): void
-  onmessage: ((e: MessageEvent) => void) | null
-  addEventListener(type: string, listener: (e: MessageEvent) => void): void
-  removeEventListener(type: string, listener: (e: MessageEvent) => void): void
-  close(): void
-}
-
-export interface DuoConfig {
-  mode: 'local' | 'tab' | 'rtc'
-  slot?: 1 | 2          // 'tab' / 'rtc': which player slot this peer occupies
-  channel?: ChannelLike | null
 }
 
 export interface RuvyxaRunnerProps {
@@ -674,7 +690,7 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
     let gameOver = false
     let paused = false
     let score = 0
-    let best = 0
+    let best = getSavedBest()
     let speed = 4.5
     let frame = 0
     let nextSpawnIn = 70
@@ -689,6 +705,16 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
     let bossesDefeated = 0
     let purged = 0
     let overclockFrames = 0
+    // Short-run variety: clearing targets in quick succession earns a forgiving shield
+    // and a brief score surge. Both are derived only from shared projectile hits.
+    let combo = 0
+    let comboWindow = 0
+    let shieldCharges = 0
+    let surgeFrames = 0
+    let invulnerableFrames = 0
+    let rewardText = ''
+    let rewardTimer = 0
+    let nextBountyAt = 180
     // Boss-side learning: samples how the runner actually evades, so it can aim at the
     // habit instead of firing blind.
     let dodgeDuckFrames = 0
@@ -740,6 +766,19 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
     // Drives the outbound send rate on its own. `frame` stops advancing while paused,
     // which would pin `frame % 2` to a constant and make the throttle meaningless.
     let netTick      = 0
+    const random = isTabDuo ? createSeededRandom(duo?.seed ?? 'ruvy-duo') : Math.random
+    const scoreMode: ScoreMode = isLocalDuo ? 'local-duo' : isTabDuo ? 'online-duo' : 'solo'
+
+    function sendDuoAction(action: DuoAction) {
+      if (isTabDuo && duo?.channel) duo.channel.postMessage(action)
+    }
+
+    // Co-op keeps the original map but gives the pair more reaction time and bosses that
+    // reward coordinated fire instead of turning a shared run into a punishment.
+    if (isLocalDuo || isTabDuo) {
+      speed = 3.9
+      nextSpawnIn = 95
+    }
 
     function seedScenery() {
       scenery = []
@@ -762,10 +801,10 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
       }
       for (let i = 0; i < 14; i++) {
         scenery.push({
-          x: Math.random() * WIDTH,
+          x: random() * WIDTH,
           kind: 'star',
-          y: 8 + Math.random() * 70,
-          size: 1 + Math.random() * 1.5,
+          y: 8 + random() * 70,
+          size: 1 + random() * 1.5,
         })
       }
       for (let i = 0; i < 2; i++) {
@@ -784,9 +823,9 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
       particles = []
       boss = null
       score = 0
-      speed = 4.5
+      speed = isLocalDuo || isTabDuo ? 3.9 : 4.5
       frame = 0
-      nextSpawnIn = 70
+      nextSpawnIn = isLocalDuo || isTabDuo ? 95 : 70
       ammo = MAX_AMMO
       ammoTick = 0
       ducking = false
@@ -799,6 +838,14 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
       bossesDefeated = 0
       purged = 0
       overclockFrames = 0
+      combo = 0
+      comboWindow = 0
+      shieldCharges = 0
+      surgeFrames = 0
+      invulnerableFrames = 0
+      rewardText = ''
+      rewardTimer = 0
+      nextBountyAt = 180
       dodgeDuckFrames = 0
       dodgeAirFrames = 0
       duckStreakFrames = 0
@@ -846,10 +893,12 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
     function jump() {
       if (!started) {
         started = true
+        sendDuoAction({ type: 'duo-action', action: 'start' })
         return
       }
       if (gameOver || won) {
         reset()
+        sendDuoAction({ type: 'duo-action', action: 'reset' })
         return
       }
       if (paused) return
@@ -862,8 +911,15 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
     function shoot() {
       if (!started || gameOver || won || paused || ammo <= 0) return
       ammo--
-      bolts.push({ x: runner.x + 8 * PIXEL, y: runner.y + (ducking ? 6 : 10) })
+      const y = runner.y + (ducking ? 6 : 10)
+      bolts.push({ x: runner.x + 8 * PIXEL, y, owner: mySlot })
+      sendDuoAction({ type: 'duo-action', action: 'shoot', y, owner: mySlot })
       emit({ ammo })
+    }
+
+    function shootPartner(y: number, owner: 1 | 2) {
+      const partnerX = owner === 1 ? 48 : 96
+      bolts.push({ x: partnerX + 8 * PIXEL, y, owner })
     }
 
     // ── P2 controls (local duo) ────────────────────────────────────────────
@@ -933,7 +989,9 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
     // that habit: a crouch-heavy player gets the low lane (a crouch cannot clear it), an
     // air-heavy player gets the high lane. Kept partly random so it stays unpredictable.
     function adaptiveHigh(b: Boss) {
-      if (b.tier < 1 || Math.random() < 0.3) return b.volley % 2 === 0
+      // Remote player movement arrives asynchronously, so it cannot safely steer a shared
+      // boss. A deterministic volley pattern keeps the online map identical on both peers.
+      if (isTabDuo || b.tier < 1 || random() < 0.3) return b.volley % 2 === 0
       return dodgeDuckFrames <= dodgeAirFrames
     }
 
@@ -951,10 +1009,12 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
       return b.enraged ? base + 1 : base
     }
 
-    // From BOSS_MIX_TIER onward a boss borrows another variant's pattern now and then.
+    // Early fights teach a boss's signature. Once a phase has broken, the same boss starts
+    // borrowing patterns so a player cannot solve the whole fight with one rhythm.
     function pickAttack(b: Boss): BossAttack {
-      if (b.tier < BOSS_MIX_TIER || b.volley % 3 !== 2) return b.variant.attack
-      return BOSS_VARIANTS[Math.floor(Math.random() * BOSS_VARIANTS.length)].attack
+      if (b.phase === 0 && b.tier < BOSS_MIX_TIER) return b.variant.attack
+      if (b.volley % 2 === 0) return b.variant.attack
+      return BOSS_VARIANTS[Math.floor(random() * BOSS_VARIANTS.length)].attack
     }
 
     function fireBoss(b: Boss) {
@@ -1065,10 +1125,67 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
       b.volley++
     }
 
+    /** Fires a readable two-lane reply after players try to stun-lock the boss. */
+    function triggerCountermeasure(b: Boss) {
+      const boost = b.enraged ? b.shotSpeed * 1.35 : b.shotSpeed
+      b.guardFrames = 42
+      b.hitChain = 0
+      b.hitChainTimer = 0
+      shots.push(makeShot(b.x, HIGH_LANE, { vx: 5.2 + boost, size: 8 }))
+      shots.push(makeShot(b.x - 26 * (4.8 + boost), GROUND_LANE, { vx: 4.8 + boost, size: 8 }))
+      b.cooldown = Math.max(24, Math.floor(b.fireInterval * 0.65))
+      b.volley++
+      rewardText = 'COUNTERMEASURE — DUCK, THEN JUMP'
+      rewardTimer = 105
+    }
+
+    /** Applies boss damage without allowing hits to indefinitely cancel its offense. */
+    function damageBoss(b: Boss, bolt: Bolt) {
+      bolt.x = WIDTH + 999
+      if (b.guardFrames > 0) {
+        burst(b.x + sprW(b.sprite) / 2, b.y + sprH(b.sprite) / 2, 4)
+        return
+      }
+
+      b.hp--
+      burst(b.x + sprW(b.sprite) / 2, b.y + sprH(b.sprite) / 2, 12)
+      b.hitChain = b.hitChainTimer > 0 ? b.hitChain + 1 : 1
+      b.hitChainTimer = 84
+      // A hit earns a brief stagger, not the old one-second attack cancel.
+      b.cooldown = Math.max(b.cooldown, 16)
+
+      if (b.hp > 0 && b.hitChain >= 3) triggerCountermeasure(b)
+
+      const nextPhase = Math.min(2, Math.floor((1 - b.hp / b.maxHp) * 3))
+      if (b.hp > 0 && nextPhase > b.phase) {
+        b.phase = nextPhase
+        b.fireInterval = Math.max(24, Math.floor(b.fireInterval * 0.86))
+        b.cooldown = Math.min(b.cooldown, 10)
+        rewardText = `BOSS PHASE ${b.phase + 1} — PATTERN SHIFT`
+        rewardTimer = 120
+      }
+
+      if (b.hp <= 0) defeatBoss(b)
+    }
+
+    /** Resolves the one shared boss defeat path for solo and local-Duo projectiles. */
+    function defeatBoss(defeatedBoss: Boss) {
+      score += 150
+      burst(defeatedBoss.x + sprW(defeatedBoss.sprite) / 2, defeatedBoss.y + sprH(defeatedBoss.sprite) / 2, 24)
+      const label = defeatedBoss.variant.label
+      bossKills[label] = (bossKills[label] ?? 0) + 1
+      bossesDefeated++
+      boss = null
+      emit({ bossName: null, score })
+      nextBossAt = score + Math.max(140, 350 - Math.floor(score / 20_000) * 5)
+      shots = []
+    }
+
     function togglePause() {
       if (!started || gameOver || won) return
       paused = !paused
       ducking = false
+      sendDuoAction({ type: 'duo-action', action: 'pause' })
     }
 
     function drawSprite(
@@ -1113,7 +1230,7 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
 
     const sprH = (s: string[]) => s.length * PIXEL
     const sprW = (s: string[]) => s[0].length * PIXEL
-    const pick = <T,>(list: readonly T[]): T => list[Math.floor(Math.random() * list.length)]
+    const pick = <T,>(list: readonly T[]): T => list[Math.floor(random() * list.length)]
 
     type Box = { x: number; y: number; w: number; h: number }
     const overlap = (a: Box, b: Box) =>
@@ -1138,7 +1255,7 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
     }
 
     function spawnObstacle() {
-      const roll = Math.random()
+      const roll = random()
       if (roll < 0.55) {
         const sprite = pick(BUG_SPRITES)
         obstacles.push({ x: WIDTH + 10, y: GROUND_Y - sprH(sprite), sprite, kind: 'bug', hp: 1 })
@@ -1155,6 +1272,48 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
           hp: 2,
         })
       }
+    }
+
+    function spawnBounty() {
+      obstacles.push({
+        x: WIDTH + 12,
+        y: GROUND_Y - 42,
+        sprite: BOUNTY_SPRITE,
+        kind: 'bounty',
+        hp: 1,
+      })
+    }
+
+    /** Records a shot-down target and unlocks the short reward cadence. */
+    function registerPurge(kind: ObstacleKind) {
+      const isBounty = kind === 'bounty'
+      score += isBounty ? 100 : 25
+      purged++
+      combo = comboWindow > 0 ? combo + 1 : 1
+      comboWindow = 210
+      rewardText = isBounty ? 'PRIORITY PURGED +100' : `LINK ${combo}/3`
+      rewardTimer = 75
+
+      if (combo >= 3) {
+        combo = 0
+        comboWindow = 0
+        shieldCharges = Math.min(2, shieldCharges + 1)
+        surgeFrames = Math.max(surgeFrames, 300)
+        rewardText = 'FIREWALL ONLINE · OVERCLOCK'
+        rewardTimer = 150
+      }
+    }
+
+    /** Returns true when a limited firewall charge absorbs the current collision. */
+    function absorbHit(x: number, y: number): boolean {
+      if (invulnerableFrames > 0) return true
+      if (shieldCharges <= 0) return false
+      shieldCharges--
+      invulnerableFrames = 50
+      rewardText = 'FIREWALL BLOCKED HIT'
+      rewardTimer = 120
+      burst(x, y, 18)
+      return true
     }
 
     function drawScenery(theme: ReturnType<typeof resolveTheme>) {
@@ -1201,11 +1360,14 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
       }
     }
 
-    function endGame() {
+    function endGame(shareWithPartner = true) {
+      if (gameOver) return
       gameOver = true
-      best = Math.max(best, score)
+      const scoreHistory = saveScore(score, scoreMode)
+      best = Math.max(best, scoreHistory[0]?.score ?? 0)
       burst(runner.x + 12, runner.y + 12, 14)
-      emit({ gameOver: true, score, best })
+      emit({ gameOver: true, score, best, scoreHistory })
+      if (shareWithPartner) sendDuoAction({ type: 'duo-action', action: 'down' })
       if (autoPlay) {
         aiRestartTimer = 45
         aiCaution = Math.min(4, aiCaution + 1)
@@ -1530,6 +1692,15 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
       ctx!.stroke()
 
       if (started && !gameOver && !won && !paused) {
+        if (comboWindow > 0) {
+          comboWindow--
+        } else {
+          combo = 0
+        }
+        if (surgeFrames > 0) surgeFrames--
+        if (invulnerableFrames > 0) invulnerableFrames--
+        if (rewardTimer > 0) rewardTimer--
+
         for (const s of scenery) {
           const factor =
             s.kind === 'star'
@@ -1544,7 +1715,7 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
                       ? 0.6
                       : 1
           s.x -= speed * factor
-          if (s.x < -80) s.x = WIDTH + Math.random() * 120
+          if (s.x < -80) s.x = WIDTH + random() * 120
         }
 
         runner.vy += GRAVITY
@@ -1589,7 +1760,14 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
           const owed = BOSS_VARIANTS.filter((v) => (bossKills[v.label] ?? 0) < WIN_BOSS_EACH)
           const variant = pick(owed.length ? owed : BOSS_VARIANTS)
           const tier = bossTier(score, bossesDefeated, frame)
-          const scaled = scaleBoss(variant, tier)
+          const baseScale = scaleBoss(variant, tier)
+          const scaled = isLocalDuo || isTabDuo
+            ? {
+                ...baseScale,
+                hp: Math.max(2, Math.ceil(baseScale.hp * 0.7)),
+                fireInterval: Math.round(baseScale.fireInterval * 1.18),
+              }
+            : baseScale
           boss = {
             x: WIDTH + 40,
             y: variant.spawnY,
@@ -1608,6 +1786,10 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
             approachSpeed: scaled.approachSpeed,
             shotSpeed: scaled.shotSpeed,
             attack: variant.attack,
+            phase: 0,
+            hitChain: 0,
+            hitChainTimer: 0,
+            guardFrames: 0,
             enraged: false,
           }
           dodgeDuckFrames = 0
@@ -1620,7 +1802,11 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
           nextSpawnIn--
           if (nextSpawnIn <= 0) {
             spawnObstacle()
-            nextSpawnIn = 60 + Math.floor(Math.random() * 45)
+            nextSpawnIn = (isLocalDuo || isTabDuo ? 85 : 60) + Math.floor(random() * 45)
+          }
+          if (score >= nextBountyAt) {
+            spawnBounty()
+            nextBountyAt = score + 210 + Math.floor(random() * 110)
           }
         }
 
@@ -1631,6 +1817,9 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
         if (boss) {
           const v = boss.variant
           boss.t++
+          if (boss.hitChainTimer > 0) boss.hitChainTimer--
+          else boss.hitChain = 0
+          if (boss.guardFrames > 0) boss.guardFrames--
           // Four-frame loop, advanced on the fixed step so every boss idles at the same tempo.
           boss.animation = (boss.animation + 0.12) % v.frames.length
           boss.sprite = v.frames[Math.floor(boss.animation)]
@@ -1663,14 +1852,14 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
           }
 
           boss.cooldown--
-          if (boss.cooldown <= 0) fireBoss(boss)
+          if (boss.guardFrames === 0 && boss.cooldown <= 0) fireBoss(boss)
           const bBox = {
             x: boss.x + 4,
             y: boss.y + 4,
             w: sprW(boss.sprite) - 8,
             h: sprH(boss.sprite) - 8,
           }
-          if (overlap(activeRunnerBox(), bBox)) endGame()
+          if (overlap(activeRunnerBox(), bBox) && !absorbHit(runner.x + 12, runner.y + 12)) endGame()
         }
 
         const spawnedShots: Shot[] = []
@@ -1702,8 +1891,7 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
               b.x = WIDTH + 999
               burst(o.x + sprW(o.sprite) / 2, o.y + sprH(o.sprite) / 2, 8)
               if (o.hp <= 0) {
-                score += 25
-                purged++
+                registerPurge(o.kind)
               }
             }
           }
@@ -1711,25 +1899,7 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
             boss &&
             overlap(bBox, { x: boss.x, y: boss.y, w: sprW(boss.sprite), h: sprH(boss.sprite) })
           ) {
-            boss.hp--
-            b.x = WIDTH + 999
-            burst(boss.x + sprW(boss.sprite) / 2, boss.y + sprH(boss.sprite) / 2, 12)
-            // Landing a hit buys a solid reprieve from return fire.
-            boss.cooldown = Math.max(boss.cooldown, 60)
-            boss.burst = 0
-            if (boss.hp <= 0) {
-              score += 150
-              burst(boss.x + sprW(boss.sprite) / 2, boss.y + sprH(boss.sprite) / 2, 24)
-              const label = boss.variant.label
-              bossKills[label] = (bossKills[label] ?? 0) + 1
-              bossesDefeated++
-              boss = null
-              emit({ bossName: null, score })
-              // The gap between fights shrinks with distance (floor 140), so bosses show
-              // up more and more often deep into a run — not just individually stronger.
-              nextBossAt = score + Math.max(140, 350 - Math.floor(score / 20_000) * 5)
-              shots = []
-            }
+            damageBoss(boss, b)
           }
         }
         bolts = bolts.filter((b) => b.x < WIDTH + 20)
@@ -1738,14 +1908,14 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
         // collisions against the runner
         const rBox = activeRunnerBox()
         for (const o of obstacles) {
-          if (overlap(rBox, obstacleBox(o))) endGame()
+          if (o.kind !== 'bounty' && overlap(rBox, obstacleBox(o)) && !absorbHit(runner.x + 12, runner.y + 12)) endGame()
         }
         for (const s of shots) {
-          if (overlap(rBox, { x: s.x, y: s.y, w: s.size + 1, h: s.size + 1 })) endGame()
+          if (overlap(rBox, { x: s.x, y: s.y, w: s.size + 1, h: s.size + 1 }) && !absorbHit(runner.x + 12, runner.y + 12)) endGame()
         }
 
         if (frame % 6 === 0) {
-          score++
+          score += surgeFrames > 0 ? 2 : 1
           // Emit score every 10 pts to keep HUD updated without flooding events
           if (score % 10 === 0) emit({ score, best })
         }
@@ -1773,37 +1943,22 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
                 o.hp--
                 b.x = WIDTH + 999
                 burst(o.x + sprW(o.sprite) / 2, o.y + sprH(o.sprite) / 2, 8)
-                if (o.hp <= 0) { score += 25; purged++ }
+                if (o.hp <= 0) registerPurge(o.kind)
               }
             }
             if (boss && overlap(bBox, { x: boss.x, y: boss.y, w: sprW(boss.sprite), h: sprH(boss.sprite) })) {
-              boss.hp--
-              b.x = WIDTH + 999
-              burst(boss.x + sprW(boss.sprite) / 2, boss.y + sprH(boss.sprite) / 2, 12)
-              boss.cooldown = Math.max(boss.cooldown, 60)
-              boss.burst = 0
-              if (boss.hp <= 0) {
-                score += 150
-                burst(boss.x + sprW(boss.sprite) / 2, boss.y + sprH(boss.sprite) / 2, 24)
-                const label = boss.variant.label
-                bossKills[label] = (bossKills[label] ?? 0) + 1
-                bossesDefeated++
-                boss = null
-                emit({ bossName: null, score })
-                nextBossAt = score + Math.max(140, 350 - Math.floor(score / 20_000) * 5)
-                shots = []
-              }
+              damageBoss(boss, b)
             }
           }
           bolts2 = bolts2.filter((b) => b.x < WIDTH + 20)
 
           // P2 collision check
           const r2Box = activeRunner2Box()
-          for (const o of obstacles) { if (overlap(r2Box, obstacleBox(o))) endGame() }
-          for (const s of shots) { if (overlap(r2Box, { x: s.x, y: s.y, w: s.size + 1, h: s.size + 1 })) endGame() }
+          for (const o of obstacles) { if (o.kind !== 'bounty' && overlap(r2Box, obstacleBox(o)) && !absorbHit(runner2.x + 12, runner2.y + 12)) endGame() }
+          for (const s of shots) { if (overlap(r2Box, { x: s.x, y: s.y, w: s.size + 1, h: s.size + 1 }) && !absorbHit(runner2.x + 12, runner2.y + 12)) endGame() }
           if (boss) {
             const bBoxB = { x: boss.x + 4, y: boss.y + 4, w: sprW(boss.sprite) - 8, h: sprH(boss.sprite) - 8 }
-            if (overlap(r2Box, bBoxB)) endGame()
+            if (overlap(r2Box, bBoxB) && !absorbHit(runner2.x + 12, runner2.y + 12)) endGame()
           }
         }
       }
@@ -1839,14 +1994,28 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
       for (const p of particles) ctx!.fillRect(p.x, p.y, PIXEL, PIXEL)
 
       // entities
-      for (const o of obstacles) drawSprite(o.sprite, o.x, o.y)
+      for (const o of obstacles) {
+        if (o.kind === 'bounty') {
+          drawOutline(o.sprite, o.x, o.y, PIXEL, outline)
+          drawSprite(o.sprite, o.x, o.y, PIXEL, '#fbbf24', '#fff7ed')
+        } else {
+          drawSprite(o.sprite, o.x, o.y)
+        }
+      }
       if (boss) {
+        if (boss.guardFrames > 0) {
+          ctx!.strokeStyle = '#22d3ee'
+          ctx!.lineWidth = 2
+          ctx!.strokeRect(boss.x - 5, boss.y - 5, sprW(boss.sprite) + 10, sprH(boss.sprite) + 10)
+        }
         drawOutline(boss.sprite, boss.x, boss.y, PIXEL, outline)
         drawSprite(boss.sprite, boss.x, boss.y, PIXEL, boss.variant.color, boss.variant.accent)
       }
 
-      ctx!.fillStyle = ACCENT
-      for (const b of bolts) ctx!.fillRect(b.x, b.y, 10, 4)
+      for (const b of bolts) {
+        ctx!.fillStyle = b.owner === 2 ? ACCENT_2 : ACCENT
+        ctx!.fillRect(b.x, b.y, 10, 4)
+      }
       for (const s of shots) {
         const core = Math.max(3, Math.round(s.size / 3))
         ctx!.fillStyle = outline
@@ -1948,8 +2117,31 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
         ctx!.fillRect(52 + i * 12, 15, 8, 10)
       }
 
+      if (comboWindow > 0) {
+        ctx!.fillStyle = '#fbbf24'
+        ctx!.font = "10px 'SFMono-Regular', Consolas, monospace"
+        ctx!.fillText(`LINK ${combo}/3`, 20, 54)
+      }
+      if (shieldCharges > 0) {
+        ctx!.fillStyle = '#22d3ee'
+        ctx!.font = "10px 'SFMono-Regular', Consolas, monospace"
+        ctx!.fillText(`FIREWALL ${'▣'.repeat(shieldCharges)}`, 20, 68)
+      }
+      if (surgeFrames > 0) {
+        ctx!.fillStyle = '#fbbf24'
+        ctx!.font = "10px 'SFMono-Regular', Consolas, monospace"
+        ctx!.fillText(`OVERCLOCK ×2 ${Math.ceil(surgeFrames / 60)}s`, 20, 82)
+      }
+      if (rewardTimer > 0) {
+        ctx!.fillStyle = rewardText.includes('FIREWALL') ? '#22d3ee' : '#fbbf24'
+        ctx!.font = "11px 'SFMono-Regular', Consolas, monospace"
+        ctx!.textAlign = 'center'
+        ctx!.fillText(rewardText, WIDTH / 2, 28)
+        ctx!.textAlign = 'left'
+      }
+
       if (boss) {
-        const title = boss.tier > 0 ? `${boss.variant.label} T${boss.tier}` : boss.variant.label
+        const title = `${boss.variant.label} P${boss.phase + 1}${boss.tier > 0 ? ` T${boss.tier}` : ''}`
         ctx!.fillStyle = hudMuted
         ctx!.fillText(title, 20, 36)
         // Boss names vary in length, so measure rather than assume a fixed bar offset.
@@ -1957,6 +2149,11 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
         for (let i = 0; i < boss.maxHp; i++) {
           ctx!.fillStyle = i < boss.hp ? boss.variant.color : FAINT
           ctx!.fillRect(barX + i * 12, 37, 8, 10)
+        }
+        if (boss.guardFrames > 0) {
+          ctx!.fillStyle = '#22d3ee'
+          ctx!.font = "9px 'SFMono-Regular', Consolas, monospace"
+          ctx!.fillText('COUNTERMEASURE', 20, 50)
         }
       }
 
@@ -1974,7 +2171,8 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
         ctx!.fillStyle = hudMuted
         ctx!.font = "12px 'SFMono-Regular', Consolas, monospace"
         ctx!.fillText('SPACE/W JUMP   S DUCK   X/ARROWS SHOOT   ESC PAUSE', WIDTH / 2, 110)
-        ctx!.fillText('ALT+T TOGGLE AI AUTOPLAY', WIDTH / 2, 126)
+        ctx!.fillText('PURGE 3 TARGETS FAST — EARN FIREWALL + OVERCLOCK', WIDTH / 2, 126)
+        ctx!.fillText('ALT+T TOGGLE AI AUTOPLAY', WIDTH / 2, 142)
       }
       if (paused && !gameOver && !won) {
         ctx!.fillStyle = 'rgba(255, 255, 255, 0.82)'
@@ -2079,15 +2277,29 @@ export default function RuvyxaRunner({ duoConfig }: RuvyxaRunnerProps = {}) {
     if (isTabDuo && duo?.channel) {
       const ch = duo.channel
       const onMsg = (e: MessageEvent) => {
-        if (e.data?.type !== 'runner-state') return
-        remoteY      = e.data.y ?? remoteY
-        remoteGround = e.data.onGround ?? remoteGround
-        remoteDuck   = e.data.ducking ?? remoteDuck
-        remoteAmmo   = e.data.ammo ?? remoteAmmo
-        remoteScore  = e.data.score ?? remoteScore
-        remoteAlive  = e.data.alive ?? remoteAlive
-        // Emit partner's ammo for a shared HUD if ever needed
-        emit({ remoteAmmo, remoteScore })
+        if (isRunnerStateMessage(e.data)) {
+          remoteY      = e.data.y
+          remoteGround = e.data.onGround
+          remoteDuck   = e.data.ducking
+          remoteAmmo   = e.data.ammo
+          remoteScore  = e.data.score
+          remoteAlive  = e.data.alive
+          emit({ remoteAmmo, remoteScore })
+          return
+        }
+        if (!isDuoAction(e.data)) return
+        if (e.data.action === 'start') {
+          started = true
+        } else if (e.data.action === 'reset') {
+          reset()
+        } else if (e.data.action === 'pause') {
+          paused = !paused
+          ducking = false
+        } else if (e.data.action === 'down') {
+          endGame(false)
+        } else if (e.data.action === 'shoot' && e.data.owner !== mySlot) {
+          shootPartner(e.data.y, e.data.owner)
+        }
       }
       ch.addEventListener('message', onMsg)
       channelCleanup = () => ch.removeEventListener('message', onMsg)
